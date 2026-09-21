@@ -594,6 +594,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --performance-memory-only)
 	add_test(NAME shader_precompile_gpu
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-precompile-only)
+	add_test(NAME shader_recompiler_helper_quad
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
