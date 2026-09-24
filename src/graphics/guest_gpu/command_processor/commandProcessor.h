@@ -16,6 +16,17 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
+enum class PredicateSync { None, Download, Drain };
+
+[[nodiscard]] constexpr PredicateSync ClassifyPredicateSync(bool image_gpu_modified,
+                                                            bool pending_image_writeback,
+                                                            bool buffer_gpu_dirty) {
+	if (image_gpu_modified || pending_image_writeback) {
+		return PredicateSync::Drain;
+	}
+	return buffer_gpu_dirty ? PredicateSync::Download : PredicateSync::None;
+}
+
 enum class ContextStateOperation : uint32_t {
 	Clear     = 0,
 	Push      = 1,
@@ -149,6 +160,7 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void SynchronizePredicate(uint64_t address, uint64_t size);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 

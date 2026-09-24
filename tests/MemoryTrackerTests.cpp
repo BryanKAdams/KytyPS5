@@ -780,6 +780,134 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+void TestBdaHintPublication() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  tracker.PublishBdaHints(region_size * 64 - 1, 2);
+  Check(tracker.ConsumeBdaHintWord(0) == (uint64_t{1} << 63) &&
+            tracker.ConsumeBdaHintWord(1) == 1,
+        "cross-word publication lost one region");
+  tracker.PublishBdaHints(TRACKER_ADDRESS_SIZE - 1, UINT64_MAX);
+  Check(tracker.ConsumeBdaHintWord(MemoryTracker::BDA_HINT_WORDS - 1) ==
+            (uint64_t{1} << 63),
+        "last-address publication overflowed the hint index");
+
+  constexpr uint64_t address = 0x0000000203000000ull;
+  const auto region = address / region_size;
+  Check(tracker.FindRegion(region) == nullptr,
+        "hint publication unnecessarily allocated a tracker region");
+  tracker.PublishBdaHints(address, 1);
+  const auto claimed = tracker.ConsumeBdaHintWord(region / 64);
+  Check(claimed == (uint64_t{1} << (region % 64)),
+        "untracked registration did not publish its region");
+  Check(tracker.IsRegionCpuModified(address, 1) &&
+            tracker.FindRegion(region) != nullptr &&
+            tracker.IsBdaHintPending(region),
+        "new manager became visible without a CPU-dirty hint");
+
+  // A failed pass must merge its unfinished claim with a different concurrent
+  // publication.
+  (void)tracker.ConsumeBdaHintWord(region / 64);
+  tracker.PublishBdaHints(address + region_size, 1);
+  tracker.RestoreBdaHints(region / 64, claimed);
+  Check(tracker.IsBdaHintPending(region) &&
+            tracker.IsBdaHintPending(region + 1),
+        "restoring an unfinished claim overwrote a concurrent hint");
+}
+
+void TestBdaHintRaces() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto region = address / region_size;
+  const auto page = (address % region_size) / Libs::Graphics::TRACKER_PAGE_SIZE;
+  const auto mask = uint64_t{1} << (region % 64);
+  memory[0] = 7;
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  (void)tracker.ConsumeBdaHintWord(region / 64);
+  auto *manager = tracker.FindRegion(region);
+  Check(manager != nullptr, "upload failed to create its tracker region");
+
+  // The consumer has already snapshotted a clean page when a later CPU write
+  // arrives.
+  const auto clean_snapshot = tracker.SnapshotCpuDirty(*manager);
+  Check(!clean_snapshot.Get(page),
+        "initial BDA snapshot was unexpectedly dirty");
+  std::binary_semaphore publish{0};
+  std::binary_semaphore published{0};
+  std::jthread writer([&] {
+    publish.acquire();
+    tracker.MarkRegionAsCpuModified(address, page_size);
+    memory[0] = 11;
+    published.release();
+  });
+  publish.release();
+  published.acquire();
+  writer.join();
+  Check(tracker.IsBdaHintPending(region) &&
+            tracker.BdaHintsCoverCpuDirty(address, page_size),
+        "write after a clean snapshot lost its next-pass hint");
+
+  Check((tracker.ConsumeBdaHintWord(region / 64) & mask) != 0,
+        "next BDA pass did not claim the racing write");
+  Check(tracker.SnapshotCpuDirty(*manager).Get(page),
+        "next BDA snapshot did not include the racing write");
+
+  // A second write after the upload copies must survive the current pass
+  // completing.
+  uint8_t uploaded_value = 0;
+  std::binary_semaphore copied{0};
+  std::binary_semaphore rewritten{0};
+  std::jthread rewriter([&] {
+    copied.acquire();
+    tracker.MarkRegionAsCpuModified(address, page_size);
+    memory[0] = 23;
+    rewritten.release();
+  });
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      [&]() noexcept {
+        uploaded_value = memory[0];
+        copied.release();
+        rewritten.acquire();
+      });
+  rewriter.join();
+  Check(uploaded_value == 11 &&
+            tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.IsBdaHintPending(region),
+        "write after upload copy was cleared by the completed pass");
+
+  // Republishing an already-dirty page after exchange must also remain visible.
+  (void)tracker.ConsumeBdaHintWord(region / 64);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Check(tracker.IsBdaHintPending(region),
+        "already-dirty write did not republish its consumed hint");
+  (void)tracker.ConsumeBdaHintWord(region / 64);
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      [&]() noexcept { uploaded_value = memory[0]; });
+  Check(uploaded_value == 23 &&
+            !tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.BdaHintsCoverCpuDirty(address, page_size),
+        "subsequent upload did not observe the latest CPU bytes");
+
+  tracker.InvalidateRegion(address, page_size,
+                           [] { Check(false, "unexpected GPU producer"); });
+  Check(tracker.IsBdaHintPending(region),
+        "fault invalidation did not publish a CPU-dirty hint");
+  (void)tracker.ConsumeBdaHintWord(region / 64);
+  tracker.UntrackMemory(address, page_size * 2);
+  Check(tracker.IsBdaHintPending(region),
+        "untracking did not republish dirty pages");
+  Release(memory);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -939,6 +1067,8 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestBdaHintPublication();
+  TestBdaHintRaces();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

@@ -50,6 +50,15 @@ bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
                               bool invalid_negative) {
 	const auto argument = ReadF16AsF32(inst.src0);
 	auto       result   = IR::F32(ir.Emit(opcode, {argument}));
+	if (opcode == IR::ValueOpcode::FPFract32) {
+		// AMD RDNA2 ISA (70648), section 12.8, follows DX frac's [0, 1) range.
+		// Bound before packing and destination OMOD so half rounding cannot produce 1.0.
+		// An ordered comparison leaves NaN results unchanged.
+		const auto maximum = IR::F32(IR::Value::F32(0.99951171875f)); // half 0x3bff
+		const auto exceeds =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, maximum}));
+		result = SelectF32(exceeds, maximum, result);
+	}
 	if (!invalid_negative) {
 		WriteF16(DestinationOperand(inst), result);
 		return true;

@@ -5,8 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -285,6 +287,145 @@ void TestWakeZeroIsNoOp() {
   }
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// The callback is invoked after the native wait times out, while the guest wait
+// remains registered. Holding it here makes the wake-before-repark race
+// deterministic, without sleeps.
+struct SignalGate {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool entered = false;
+  bool released = false;
+
+  void Enter() {
+    std::unique_lock lock(mutex);
+    entered = true;
+    condition.notify_all();
+    Check(condition.wait_for(lock, std::chrono::seconds(3),
+                             [&] { return released; }),
+          "signal callback was released");
+  }
+
+  void AwaitEntry() {
+    std::unique_lock lock(mutex);
+    Check(condition.wait_for(lock, std::chrono::seconds(3),
+                             [&] { return entered; }),
+          "waiter reached its signal callback");
+  }
+
+  void Release() {
+    std::lock_guard lock(mutex);
+    released = true;
+    condition.notify_all();
+  }
+};
+
+thread_local SignalGate *g_signal_gate = nullptr;
+
+void GatedSignalPoll() {
+  if (auto *gate = g_signal_gate) {
+    g_signal_gate = nullptr;
+    gate->Enter();
+  }
+}
+
+void TestWakeDuringSignalCallback() {
+  uint64_t word = 0;
+  uint32_t timeout = 1000000;
+  SignalGate gate;
+  int result = -1;
+  std::thread waiter([&] {
+    g_signal_gate = &gate;
+    result = Wait64(&word, 0, &timeout, GatedSignalPoll);
+  });
+  gate.AwaitEntry();
+  Check(Wake(&word, 1) == OK, "explicit wake during callback succeeds");
+  gate.Release();
+  waiter.join();
+  Check(result == OK && word == 0,
+        "unchanged-value wake is retained across callback and native repark");
+}
+
+void TestCountedWakesDuringCallbacks() {
+  uint32_t word = 0;
+  uint32_t timeout = 500000;
+  SignalGate gates[4];
+  int results[4] = {};
+  std::vector<std::thread> waiters;
+  for (int i = 0; i < 4; ++i) {
+    waiters.emplace_back([&, i] {
+      g_signal_gate = &gates[i];
+      results[i] = Wait32(&word, 0, &timeout, GatedSignalPoll);
+    });
+    gates[i].AwaitEntry(); // Registers in a known order before the next waiter
+                           // starts.
+  }
+  Check(Wake(&word, 0) == OK, "zero wake does not claim a registered waiter");
+  Check(Wake(&word, 1) == OK && Wake(&word, 2) == OK,
+        "separate finite wakes claim distinct registered waiters");
+  for (auto &gate : gates)
+    gate.Release();
+  for (auto &waiter : waiters)
+    waiter.join();
+  Check(
+      results[0] == OK && results[1] == OK && results[2] == OK &&
+          results[3] == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+      "finite counts neither lose wakes nor broadcast to the remaining waiter");
+}
+
+void TestLargeFiniteWakeAndAddressReuse() {
+  uint32_t word = 0;
+  // A finite count close to INT_MAX must be bounded by registered waiters, not
+  // by count.
+  SignalGate completed;
+  std::thread empty_wake([&] {
+    Check(Wake(&word, INT_MAX - 1) == OK,
+          "large finite wake on an empty address succeeds");
+    completed.Enter();
+  });
+  completed.AwaitEntry(); // A broken O(count) loop fails within the gate's
+                          // bounded timeout.
+  completed.Release();
+  empty_wake.join();
+
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    SignalGate gate;
+    uint32_t timeout = 1000000;
+    int result = -1;
+    std::thread waiter([&] {
+      g_signal_gate = &gate;
+      result = Wait32(&word, 0, &timeout, GatedSignalPoll);
+    });
+    gate.AwaitEntry();
+    Check(Wake(&word, INT_MAX - 1) == OK,
+          "large finite wake selects existing waiters");
+    gate.Release();
+    waiter.join();
+    Check(result == OK, "address reuse does not inherit stale wake state");
+  }
+}
+
+void TestSignalCallbackReentersWaits() {
+  uint32_t word = 0;
+  uint32_t timeout = 1000;
+  const auto callback = +[] {
+    uint32_t inner = 1;
+    uint32_t immediate = 0;
+    Check(Wait32(&inner, 1, &immediate) ==
+              Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+          "signal callback may register a nested wait");
+    Check(Wake(&inner, INT_MAX - 1) == OK,
+          "nested wait unregisters before return");
+  };
+  Check(Wait32(&word, 0, &timeout, callback) ==
+            Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "callbacks execute outside registry locks and preserve the outer "
+        "deadline");
+}
+
+#endif
+
 } // namespace
 
 int main() {
@@ -297,6 +438,12 @@ int main() {
   TestAddressesAreIsolated();
   TestCompareRegisterWakeRace();
   TestWakeZeroIsNoOp();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  TestWakeDuringSignalCallback();
+  TestCountedWakesDuringCallbacks();
+  TestLargeFiniteWakeAndAddressReuse();
+  TestSignalCallbackReentersWaits();
+#endif
   std::printf("SyncOnAddressTests: all passed\n");
   return 0;
 }

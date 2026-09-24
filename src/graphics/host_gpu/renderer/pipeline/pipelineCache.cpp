@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -67,8 +68,9 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}:opt={}\n", KYTY_GIT_REVISION,
+	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid,
+	                   static_cast<uint32_t>(Config::GetShaderOptimizationType()));
 }
 
 std::string PipelineCacheTitleId() {
@@ -368,6 +370,10 @@ struct PipelineCache::ProgramCache {
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+		if (recording.IsOpen()) {
+			(void)recording.Append(ShaderPrecompile::Capture(
+			    params, options, permutation.specialization, push_data_cursor, input_info));
+		}
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -402,12 +408,14 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+	ShaderPrecompile::Journal                                   recording;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	InitializeShaderPrecompile();
 }
 
 PipelineCache::~PipelineCache() {
@@ -513,8 +521,112 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+void PipelineCache::InitializeShaderPrecompile() {
+	// Reuse the existing clean Release/revision/driver gate. In particular, a dirty build
+	// must never replay compiler inputs left by different source with the same commit ID.
+	if (!Config::ShaderPrecompileEnabled() || m_driver_cache == nullptr ||
+	    m_driver_cache_path.empty())
+		return;
+	auto path = m_driver_cache_path;
+	path.replace_extension(".shaders");
+	auto        key = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	std::string app_version;
+	(void)Loader::SystemContentParamSfoGetString("APP_VER", &app_version);
+	key += app_version;
+	auto records = m_program_cache->recording.Open(path, key);
+	if (records.empty()) return;
+	PipelineCacheLog("Shader precompile: replaying {} recorded permutations", records.size());
+	m_precompile_done.store(false, std::memory_order_release);
+	m_precompile_thread = std::jthread(
+	    [this, records = std::move(records)]() mutable { ReplayPrecompiled(std::move(records)); });
+}
+
+void PipelineCache::WaitForPrecompile() {
+	if (m_precompile_done.load(std::memory_order_acquire)) return;
+	std::lock_guard lock(m_precompile_join_mutex);
+	if (m_precompile_thread.joinable()) m_precompile_thread.join();
+	m_precompile_done.store(true, std::memory_order_release);
+}
+
+void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records) {
+	KYTY_PROFILER_THREAD("ShaderPrecompile");
+	size_t compiled = 0;
+	size_t skipped  = 0;
+	for (auto& record: records) {
+		ShaderParams params;
+		params.code            = record.code;
+		params.back_code       = record.back_code;
+		params.hash            = record.hash;
+		params.user_data_count = record.user_data_count;
+		ShaderRecompiler::CompileOptions options;
+		options.stage          = record.stage;
+		options.shader_hash    = record.hash;
+		options.user_data      = std::span(params.user_data).first(params.user_data_count);
+		options.back_code      = params.back_code;
+		options.user_data_base = record.user_data_base;
+		options.wave_size      = record.wave_size;
+		options.dump_ir        = false;
+		options.early_dump     = false;
+		options.dump_label     = "ShaderPrecompile";
+		ProgramCache::ProgramKey key;
+		key.stage           = record.stage;
+		key.hash            = record.hash;
+		key.user_data_count = record.user_data_count;
+		key.code_size       = static_cast<uint32_t>(record.code.size());
+		std::visit(
+		    [&](auto& info) {
+			    using Info = std::decay_t<decltype(info)>;
+			    if constexpr (std::is_same_v<Info, ShaderVertexInputInfo>)
+				    options.input_info.vertex = &info;
+			    else if constexpr (std::is_same_v<Info, ShaderPixelInputInfo>)
+				    options.input_info.pixel = &info;
+			    else
+				    options.input_info.compute = &info;
+			    BuildStageStaticKey(info, key.static_state);
+		    },
+		    record.info);
+
+		Common::LockGuard lock(m_mutex);
+		auto              entry = m_program_cache->programs.find(key);
+		if (entry != m_program_cache->programs.end() &&
+		    std::ranges::any_of(entry->second.permutations, [&](const auto& candidate) {
+			    const auto& layout = candidate.program.bindings;
+			    return candidate.specialization == record.specialization &&
+				       layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(record.push_data_start_dword,
+				                                                    layout.ShaderDataDwords());
+		    }))
+			continue;
+
+		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		// Reject inconsistent metadata before ApplyResourceSpecialization's hard assertions.
+		// Live guest lookups still compile normally if a record cannot be replayed.
+		if (translated.skip_dispatch || !translated.program.resource_tracking_complete ||
+		    translated.program.info.buffers.size() != record.specialization.buffers.size() ||
+		    translated.program.info.images.size() > record.specialization.images.size()) {
+			++skipped;
+			continue;
+		}
+		if (entry == m_program_cache->programs.end()) {
+			entry = m_program_cache->programs
+			            .try_emplace(std::move(key),
+			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+			            .first;
+		}
+		entry->second.permutations.push_back(m_program_cache->CompilePermutation(
+		    params, options, std::move(translated), record.specialization,
+		    record.push_data_start_dword));
+		++compiled;
+	}
+	PipelineCacheLog("Shader precompile: replayed {} permutations; skipped {}", compiled, skipped);
+}
+
 void PipelineCache::Save() {
+	// Join before acquiring the cache mutex or destroying the driver cache. This also covers
+	// the WindowRun shutdown path, which calls Save before the PipelineCache destructor.
+	WaitForPrecompile();
 	Common::LockGuard lock(m_mutex);
+	m_program_cache->recording.Close();
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -577,6 +689,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	WaitForPrecompile();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -652,6 +765,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
+	WaitForPrecompile();
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
@@ -667,7 +781,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs,
+    vk::ImageAspectFlags feedback_aspects) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -677,6 +792,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!vertex_program);
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(ps_active && !pixel_program);
+	EXIT_IF(feedback_aspects && !m_graphics.attachment_feedback_loop_enabled);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
 	Common::LockGuard lock(m_mutex);
@@ -693,6 +809,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	key.ps_shader_id            = ps_id;
 	auto& static_params         = key.static_params;
+	static_params.attachment_feedback_loop_flags = AttachmentFeedbackPipelineFlags(
+	    feedback_aspects, m_graphics.attachment_feedback_loop_dynamic_enabled);
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
 	uint32_t attachment_samples = 0;

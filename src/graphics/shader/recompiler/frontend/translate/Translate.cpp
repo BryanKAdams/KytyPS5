@@ -472,11 +472,14 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 
 IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed) {
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// RDNA2 ISA section 6.2, Table 20 fixes inline 1/(2*PI) at half 0x3118.
+		// Widen that exact value; converting the F32 inline value through the host half
+		// packer would make this input depend on its rounding mode. Other inline floats
+		// are already exactly representable in half precision.
+		const auto bits = operand.value == 0x3e22f983u ? 0x3e230000u : operand.value;
 		const bool use_zero = packed && (high_lane ? operand.op_sel_hi : operand.op_sel);
 		auto       value    = use_zero ? IR::F32(IR::Value::F32(0.0f))
-		                               : ir.BitCastF32(IR::U32(IR::Value(operand.value)));
-		const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
-		value               = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
+		                               : ir.BitCastF32(IR::U32(IR::Value(bits)));
 		if (operand.absolute) {
 			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
 		}
@@ -745,17 +748,26 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
+	// Scalar branches test the whole guest-wave mask. The raw zero flags include both halves
+	// in wave64 and only the low half in wave32; VALU masking keeps its per-invocation predicate.
+	const auto mask_zero = [this](Decoder::OperandKind kind) {
+		Decoder::Operand flag {};
+		flag.kind = kind;
+		return ir.INotEqual(ReadRawU32(flag), IR::U32(IR::Value(0u)));
+	};
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero: condition = mask_zero(Decoder::OperandKind::VccZ); break;
+		case CFG::BranchCondition::VccNonZero:
+			condition = ir.LogicalNot(mask_zero(Decoder::OperandKind::VccZ));
+			break;
+		case CFG::BranchCondition::ExecZero: condition = mask_zero(Decoder::OperandKind::ExecZ); break;
+		case CFG::BranchCondition::ExecNonZero:
+			condition = ir.LogicalNot(mask_zero(Decoder::OperandKind::ExecZ));
+			break;
 		case CFG::BranchCondition::ScalarInstruction:
 			EXIT_IF(instruction_branch_condition.IsEmpty());
 			condition = instruction_branch_condition;
@@ -1077,8 +1089,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
-			                                           u32(mesh.primitives_per_group));
+			// draw(6) carries the dispatch's base workgroup so sliced dispatches
+			// (see MeshDispatchSlice) cover the same global primitive range as a
+			// single oversized draw, keeping fan centers, strip winding and index
+			// math consistent across slices.
+			const auto primitive_chunk =
+			    entry_ir.IMul(entry_ir.IAdd(builtin(IR::StageInputKind::WorkgroupId, 0), draw(6)),
+				              u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
 			const auto chunk = entry_ir.IMul(primitive_chunk, step);

@@ -14,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -77,6 +78,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		// Publish the full resulting owner, including pages newly reachable after a merge.
+		m_memory_tracker.PublishBdaHints(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -127,11 +130,21 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
-	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	std::unique_ptr<Buffer> temporary;
+	Buffer*                 download = &m_download_buffer;
 	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 64 MiB staging buffer capacity\n");
+		// Ring wraps already wait for retirement. A reservation larger than the ring needs
+		// separate host staging, kept alive until the priority callback publishes the bytes.
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
+		download  = temporary.get();
+		mapped    = download->Mapped().data();
+		offset    = 0;
+		EXIT_IF(mapped == nullptr);
+	} else {
+		m_download_buffer.Commit();
 	}
-	m_download_buffer.Commit();
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
@@ -150,26 +163,27 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
-	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	native.copyBuffer(buffer.Handle(), download->Handle(), static_cast<uint32_t>(copies.size()),
+	                  copies.data());
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = m_download_buffer.Handle();
+	after.buffer        = download->Handle();
 	after.offset        = offset;
 	after.size          = total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies)] {
-		m_download_buffer.Invalidate(offset, total_size);
+	m_scheduler.DeferPriorityOperation([download, owner = std::move(temporary), mapped, offset,
+	                                    total_size, buffer_address, copies = std::move(copies)] {
+		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
+		(void)owner; // Retain dedicated staging through the final backing write.
 	});
 	return true;
 }
@@ -650,6 +664,113 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
+}
+
+void BufferCache::PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept {
+	m_memory_tracker.PublishBdaHints(vaddr, size);
+}
+
+void BufferCache::SynchronizeBdaLegacy(const RangeSet& mapped) {
+	// Clear before the full walk so writes racing with the walk stay pending.
+	for (size_t word = 0; word < MemoryTracker::BDA_HINT_WORDS; ++word) {
+		(void)m_memory_tracker.ConsumeBdaHintWord(word);
+	}
+	mapped.ForEach(
+	    [this](uint64_t begin, uint64_t end) { SynchronizeBuffersInRange(begin, end - begin); });
+}
+
+bool BufferCache::SynchronizeBdaSelective(const RangeSet& mapped) {
+	for (size_t word = 0; word < MemoryTracker::BDA_HINT_WORDS; ++word) {
+		uint64_t bits = m_memory_tracker.ConsumeBdaHintWord(word);
+		struct Claim {
+			MemoryTracker& tracker;
+			size_t         word;
+			uint64_t&      remaining;
+			~Claim() { tracker.RestoreBdaHints(word, remaining); }
+		} claim {m_memory_tracker, word, bits};
+		while (bits != 0) {
+			const auto region = word * 64 + static_cast<size_t>(std::countr_zero(bits));
+			if (!SynchronizeBdaRegion(region, mapped)) {
+				return false;
+			}
+			// Do not touch the shared word again: a concurrent write may have republished it.
+			bits &= bits - 1;
+		}
+	}
+	return true;
+}
+
+bool BufferCache::SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped) {
+	const auto region_begin = region * TRACKER_REGION_SIZE;
+	auto*      manager      = m_memory_tracker.FindRegion(region);
+	if (manager == nullptr) {
+		// A mapping or registration can precede tracker creation. The current consumer must
+		// see those bytes now; the full walk creates (or waits for) the initially dirty manager.
+		mapped.ForEachInRange(region_begin, TRACKER_REGION_SIZE,
+		                      [this](uint64_t begin, uint64_t end) {
+			                      SynchronizeBuffersInRange(begin, end - begin);
+		                      });
+		return true;
+	}
+	const auto dirty = m_memory_tracker.SnapshotCpuDirty(*manager);
+	if (dirty.None()) {
+		return true;
+	}
+	bool consistent = true;
+	mapped.ForEachInRange(region_begin, TRACKER_REGION_SIZE, [&](uint64_t begin, uint64_t end) {
+		if (consistent) {
+			consistent = SynchronizeDirtyOwners(dirty, region_begin, begin, end);
+		}
+	});
+	return consistent;
+}
+
+bool BufferCache::SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
+                                         uint64_t begin, uint64_t end) {
+	uint64_t   synced_end = begin;
+	auto       page       = static_cast<size_t>((begin - region_begin) / TRACKER_PAGE_SIZE);
+	const auto limit =
+	    static_cast<size_t>((end - region_begin + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
+	while (page < limit) {
+		const auto [first, last] = dirty.FirstRangeFrom(page);
+		if (first >= limit) {
+			break;
+		}
+		const auto run_end = std::min(region_begin + last * TRACKER_PAGE_SIZE, end);
+		for (auto cursor = std::max(region_begin + first * TRACKER_PAGE_SIZE, synced_end);
+		     cursor < run_end;) {
+			const auto* owner = m_page_table.Find(cursor >> CACHING_PAGEBITS);
+			if (owner == nullptr || !*owner) {
+				cursor = Common::AlignDown(cursor, CACHING_PAGESIZE) + CACHING_PAGESIZE;
+				continue;
+			}
+			auto* buffer = m_slot_buffers.try_get(*owner);
+			if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(cursor, 1)) {
+				return false;
+			}
+			const auto owner_begin = std::max(buffer->CpuAddress(), begin);
+			const auto owner_end   = std::min(buffer->CpuAddress() + buffer->Size(), end);
+			(void)SynchronizeBuffer(*buffer, owner_begin, owner_end - owner_begin, false, false);
+			synced_end = owner_end;
+			cursor     = owner_end;
+		}
+		page = last;
+	}
+	return true;
+}
+
+bool BufferCache::CheckBdaHintInvariant(const RangeSet& mapped) {
+	bool covered = true;
+	for (const auto& [address, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		mapped.ForEachInRange(address, buffer.Size(), [&](uint64_t begin, uint64_t end) {
+			covered = covered && m_memory_tracker.BdaHintsCoverCpuDirty(begin, end - begin);
+		});
+		if (!covered) {
+			break;
+		}
+	}
+	return covered;
 }
 
 } // namespace Libs::Graphics

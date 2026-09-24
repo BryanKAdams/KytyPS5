@@ -53,6 +53,8 @@ static void PrintUsage() {
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	::printf("  --bda-sync <value>                   Selective, Legacy, or SelectiveChecked. "
+	         "Default: Selective.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
@@ -64,6 +66,8 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
+	::printf("  --shader-precompile <true|false>     Replay recorded shaders before drawing. "
+	         "Default: true.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -268,6 +272,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--bda-sync") {
+			if (!ParseEnum(value, options.config.bda_sync_mode)) {
+				::printf("invalid BDA synchronization mode: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu") {
 			options.config.gpu_index = Common::ToInt32(value);
 		} else if (arg == "--vblank-frequency") {
@@ -291,6 +300,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-validation") {
 			if (!ParseBool(value, options.config.shader_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--shader-precompile") {
+			if (!ParseBool(value, options.config.shader_precompile_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

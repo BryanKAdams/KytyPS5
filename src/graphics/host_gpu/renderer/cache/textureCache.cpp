@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -14,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -307,7 +310,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.registered = false;
 }
 
-void TextureCache::DeleteImage(ImageId id) {
+void TextureCache::DeleteImage(ImageId id, std::vector<ImageId>* retired) {
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -320,7 +323,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			}
 		});
 		for (const auto association: associations) {
-			FreeImage(association);
+			FreeImage(association, retired);
 		}
 	}
 	if (image->IsGpuModified()) {
@@ -337,19 +340,44 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
+	if (retired != nullptr) {
+		retired->push_back(id);
+	} else if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
 	}
 }
 
-void TextureCache::FreeImage(ImageId id) {
-	auto& image = m_slot_images[id];
-	if (image.IsGpuModified()) {
-		image.ClearGpuModified();
+void TextureCache::FreeImage(ImageId id, std::vector<ImageId>* retired) {
+	auto* image = m_slot_images.try_get(id);
+	while (image != nullptr && image->registered &&
+	       HasPendingDownload(image->info.data.address, image->info.data.size)) {
+		// Overlap replacement also retires images outside the collector. Preserve its
+		// registration and write watcher until the last overlapping publication completes.
+		// Wait does not run general callbacks, so native resources remain alive throughout.
+		const auto completion_tick = m_scheduler.CurrentTick();
+		{
+			struct ReacquireLock {
+				explicit ReacquireLock(TrackingSpinLock& mutex): mutex(mutex) { mutex.unlock(); }
+				~ReacquireLock() { mutex.lock(); }
+				TrackingSpinLock& mutex;
+			};
+			// All callers own m_lock. Release it while waiting, including for a priority
+			// callback that needs the cache; restore it before touching the owner again.
+			const ReacquireLock unlocked(m_lock);
+			m_scheduler.Wait(completion_tick);
+			m_scheduler.WaitPriorityOperations(completion_tick);
+		}
+		image = m_slot_images.try_get(id);
 	}
-	DeleteImage(id);
+	if (image == nullptr || !image->registered) {
+		return;
+	}
+	if (image->IsGpuModified()) {
+		image->ClearGpuModified();
+	}
+	DeleteImage(id, retired);
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -1288,41 +1316,55 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 	ImageId result {};
 	{
-		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
-			}
-		}
-
+		std::unique_lock lock {m_lock};
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
-		if (!result) {
-			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
-				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+		const auto       lookup     = [&] {
+			result     = {};
+			view_mip   = -1;
+			view_layer = -1;
+			const auto candidates =
+			    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
 				}
 			}
-		}
-
-		if (result) {
-			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
-				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
-				result = {};
+			if (!result) {
+				for (const auto candidate: candidates) {
+					view_mip                = -1;
+					view_layer              = -1;
+					const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+					const auto  overlap = ResolveOverlap(merged_info, desc.type, candidate, result);
+					if (overlap.image) {
+						result     = overlap.image;
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
+				}
 			}
+			if (result) {
+				auto& resolved = m_slot_images[result];
+				if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+					result = {};
+				} else if (resolved.info.resources < desc.info.resources) {
+					FreeImage(result);
+					result = {};
+				}
+			}
+		};
+		lookup();
+		if (!result && m_last_pressure_gc_tick != m_gc_tick && m_graphics.CanReportMemoryUsage() &&
+		    m_graphics.GetDeviceMemoryUsage() >= m_pressure_gc_memory) {
+			// At most once per submission age: image misses must not age live resources or
+			// repeatedly drain a working set that cannot be reclaimed losslessly.
+			m_last_pressure_gc_tick = m_gc_tick;
+			lock.unlock();
+			(void)CollectGarbage(true);
+			lock.lock();
+			// Collection invalidates aliases and can retire the source of this lookup.
+			lookup();
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
@@ -1672,7 +1714,32 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
-	std::scoped_lock lock {m_lock};
+	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported image invalidation from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     address, size);
+	}
+	// Invalidation can release a page's write watcher even when the fault is just outside
+	// an image's byte range. Finish every writeback on that page before permitting CPU stores.
+	const auto page_begin = std::max<uint64_t>(Common::AlignDown(address, TRACKER_PAGE_SIZE), 1);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	const auto page_size  = page_end - page_begin;
+	std::unique_lock lock {m_lock};
+	while (HasPendingDownload(page_begin, page_size)) {
+		// The GPU thread can need m_lock before reaching this command. Never wait for that
+		// thread while holding the texture lock on a CPU fault path.
+		lock.unlock();
+		m_scheduler.Context().GetGpu().SendCommandSync([this, page_begin, page_size] {
+			if (HasPendingDownload(page_begin, page_size)) {
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
+		});
+		lock.lock();
+		// A new download may have been recorded before we reacquired m_lock. Its publication
+		// must also complete; checking and invalidating under this lock excludes another one.
+	}
 	InvalidateCpuAliases(address, size);
 }
 
@@ -1843,37 +1910,69 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		return false;
 	}
 	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	auto&      staging  = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	    staging.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	std::unique_ptr<Buffer> temporary;
+	Buffer*                 download = &staging;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		// Tiled and format-converted downloads also write via compute shaders, so the fallback
+		// must retain storage-buffer usage rather than only supporting transfer destinations.
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		download  = temporary.get();
+		mapped    = download->Mapped().data();
+		offset    = 0;
+		EXIT_IF(mapped == nullptr);
+	} else {
+		staging.Commit();
 	}
-	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	download->Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, std::move(transfer));
+	DownloadImage(image, *download, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
+	barrier.buffer              = download->Handle();
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	{
+		std::lock_guard lock(m_pending_download_mutex);
+		m_pending_downloads.push_back(range);
+	}
+	m_scheduler.DeferPriorityOperation(
+	    [this, download, owner = std::move(temporary), range, mapped, offset] {
+		    download->Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		    // Separate from m_lock: the GPU thread may wait for this callback while it owns the
+		    // texture cache lock (for example on staging wrap). Keep overlapping records distinct.
+		    std::lock_guard lock(m_pending_download_mutex);
+		    const auto      pending = std::ranges::find(m_pending_downloads, range);
+		    EXIT_IF(pending == m_pending_downloads.end());
+		    m_pending_downloads.erase(pending);
+		    (void)owner;
+	    });
 	return true;
+}
+
+bool TextureCache::HasPendingDownload(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::lock_guard lock(m_pending_download_mutex);
+	return std::ranges::any_of(m_pending_downloads, [address, size](const GuestRange& pending) {
+		return pending.address < address + size && address < pending.End();
+	});
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -1995,18 +2094,31 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
-	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	(void)CollectGarbage(false);
+}
+
+bool TextureCache::CollectGarbage(bool pressure_only) {
+	std::unique_lock lock {m_lock};
+	const uint64_t   tick = pressure_only ? m_gc_tick : m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
-		return;
+	if (m_total_used_memory < (pressure_only ? m_pressure_gc_memory : m_trigger_gc_memory)) {
+		return false;
 	}
+	bool                 reclaimed = false;
+	std::vector<ImageId> pending_retirement;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		const uint64_t minimum_age = aggressive ? 160 : pressured ? 80 : 16;
+		if (pressure_only && tick < minimum_age) {
+			return;
+		}
+		const uint64_t     age            = std::min(minimum_age, tick);
+		constexpr uint64_t release_margin = 256ull * 1024 * 1024;
+		const auto         release_threshold =
+		    m_critical_gc_memory - std::min(m_critical_gc_memory, release_margin);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2022,23 +2134,47 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered || owner->depth_id ||
+			    std::ranges::find(pending_retirement, id) != pending_retirement.end()) {
 				continue;
 			}
-			if (owner->IsGpuModified()) {
-				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && !pressured) {
-					continue;
-				}
-				if (safe && !DownloadImageMemory(id)) {
+			if (pressure_only && owner->tick_accessed_last == m_scheduler.CurrentTick()) {
+				continue;
+			}
+			if (owner->info.IsDepth()) {
+				bool dirty_stencil = false;
+				bool known_stencil = !owner->info.HasStencil();
+				m_slot_images.ForEach([&](ImageId, const Image& associated) {
+					if (associated.depth_id == id) {
+						known_stencil = true;
+						dirty_stencil |= associated.IsGpuModified();
+					}
+				});
+				if (dirty_stencil || !known_stencil) {
 					continue;
 				}
 			}
-			FreeImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			const bool gpu_modified = owner->IsGpuModified();
+			if (gpu_modified) {
+				// The depth transfer preserves its plane only; the stencil ownership check above
+				// prevents retiring a dirty or unknown companion. Metadata remains conservative.
+				if (!pressured || !SafeToDownload(*owner) || owner->info.HasMetadata() ||
+				    (owner->info.IsTiled() && !aggressive)) {
+					continue;
+				}
+				if (!DownloadImageMemory(id)) {
+					continue;
+				}
+			}
+			if (pressure_only || gpu_modified ||
+			    HasPendingDownload(owner->info.data.address, owner->info.data.size)) {
+				// Unregistering before publication would let CPU stores race WriteBacking.
+				pending_retirement.push_back(id);
+			} else {
+				FreeImage(id);
+			}
+			reclaimed = true;
+			if (m_total_used_memory < release_threshold && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
@@ -2052,6 +2188,24 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+	if (!pending_retirement.empty()) {
+		// Dirty eviction requires one batched completion before relinquishing guest ownership.
+		// Keep m_lock so a faulting CPU writer cannot invalidate/unprotect a victim until its
+		// priority writeback completes. Those callbacks use only the separate pending mutex.
+		// General callbacks can replace buffers after PrepareBda while a draw is being assembled;
+		// leave them for the GPU operation boundary and release only this collector's victims.
+		const auto completion_tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(completion_tick);
+		m_scheduler.WaitPriorityOperations(completion_tick);
+		std::vector<ImageId> retired;
+		for (const auto id: pending_retirement) {
+			FreeImage(id, &retired);
+		}
+		for (const auto id: retired) {
+			m_slot_images.erase(id);
+		}
+	}
+	return reclaimed;
 }
 
 void TextureCache::ProcessDownloadImages() {

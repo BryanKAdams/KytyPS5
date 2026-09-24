@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1059,15 +1060,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
-		}
+		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
 	}
 
 	if (mesh_active && draw.IsIndexed()) {
@@ -1099,17 +1092,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	vk::ImageAspectFlags feedback_aspects;
+	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+	                                            state.depth_info, feedback_aspects, stages);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// Target acquisition resolves the actual overlapping read/write aspects for this draw.
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
-	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	    state.programs, feedback_aspects);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1123,24 +1116,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
-	} else {
+	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+	if (m_context.GetGraphics().attachment_feedback_loop_dynamic_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 
@@ -1154,7 +1135,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		// Replay the draw as sliced dispatches; each slice carries its own group and
+		// instance offsets so the mesh shader sees the same inputs as one oversized
+		// dispatch would have provided.
+		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		ForEachMeshDispatch(
+		    mesh_groups, draw.instance_count, limits.maxMeshWorkGroupCount[0],
+		    limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount,
+		    [&](const MeshDispatchSlice& slice) {
+			    const uint32_t draw_data[] {draw.index_count,
+				                            draw.IsIndexed()
+			                                    ? static_cast<uint32_t>(emit.vertex_offset)
+												: emit.first_vertex,
+				                            emit.first_instance + slice.instance_offset,
+				                            index_source.guest_element_size,
+				                            static_cast<uint32_t>(index_source.address),
+				                            static_cast<uint32_t>(index_source.address >> 32u),
+				                            slice.group_offset};
+			    static_assert(std::size(draw_data) ==
+				              ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+			    vk_buffer.pushConstants(pipeline.pipeline_layout,
+				                        vk::ShaderStageFlagBits::eMeshEXT |
+				                            vk::ShaderStageFlagBits::eFragment,
+				                        0, sizeof(draw_data), draw_data);
+			    vk_buffer.drawMeshTasksEXT(slice.group_count, slice.instance_count, 1);
+		    });
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}

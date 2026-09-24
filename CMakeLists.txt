@@ -411,6 +411,23 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(frame_statistics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FrameStatisticsTests.cpp"
+)
+target_include_directories(frame_statistics_tests PRIVATE ${inc_headers})
+
+add_executable(mesh_dispatch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MeshDispatchTests.cpp"
+)
+target_include_directories(mesh_dispatch_tests PRIVATE ${inc_headers})
+
+add_executable(shader_precompile_record_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderPrecompileRecordTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp"
+)
+target_link_libraries(shader_precompile_record_tests PRIVATE fmt::fmt xxhash)
+target_include_directories(shader_precompile_record_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -487,6 +504,9 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
 )
 target_link_libraries(sync_on_address_tests common)
+if(WIN32)
+	target_link_libraries(sync_on_address_tests onecore)
+endif()
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
 
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
@@ -541,6 +561,16 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_bda_sync_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --bda-sync SelectiveChecked)
+	add_test(NAME emulator_bda_sync_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --bda-sync Invalid)
+	set_tests_properties(emulator_bda_sync_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_shader_precompile_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --shader-precompile false)
+	add_test(NAME emulator_shader_precompile_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --shader-precompile Invalid)
+	set_tests_properties(emulator_shader_precompile_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -548,6 +578,9 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME frame_statistics COMMAND $<TARGET_FILE:frame_statistics_tests>)
+	add_test(NAME mesh_dispatch COMMAND $<TARGET_FILE:mesh_dispatch_tests>)
+	add_test(NAME shader_precompile_record COMMAND $<TARGET_FILE:shader_precompile_record_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -557,6 +590,10 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME performance_memory
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --performance-memory-only)
+	add_test(NAME shader_precompile_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-precompile-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -611,6 +648,9 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		frame_statistics_tests
+		mesh_dispatch_tests
+		shader_precompile_record_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -620,6 +660,7 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		save_data_memory_tests
 	)
 endif()
 

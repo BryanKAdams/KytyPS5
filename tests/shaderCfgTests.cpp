@@ -9962,67 +9962,79 @@ void TestMeshInputAssembly() {
        0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
   for (const auto &test : cases) {
-    ShaderVertexInputInfo input{};
-    auto &mesh = input.mesh;
-    mesh.input_primitive = static_cast<uint32_t>(test.topology);
-    mesh.wave_size = test.wave_size;
-    mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
-    mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-    mesh.threads_num[0] = 256;
-    mesh.threads_num[1] = mesh.threads_num[2] = 1;
-    Decoder::Program decoded;
-    CFG::Graph graph;
-    CFG::BasicBlock block;
-    block.id = 0;
-    block.terminator.kind = CFG::TerminatorKind::Return;
-    graph.blocks.push_back(std::move(block));
-    graph.entry_block = 0;
-    Frontend::TranslateOptions options{};
-    options.stage = ShaderType::Mesh;
-    options.wave_size = test.wave_size;
-    options.user_data_count = 0;
-    options.input_info.vertex = &input;
-    auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
-    Inst *load = nullptr;
-    for (auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
-        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
-      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
-        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
-        const uint32_t value = kind == StageInputKind::LocalInvocationIndex
-                                   ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
-        inst.ReplaceUsesWith(Value(value));
-      } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
-        Check(load == nullptr, "mesh index fetch emitted duplicate loads");
-        load = &inst;
+    for (const uint32_t slice_group : {0u, test.group}) {
+      ShaderVertexInputInfo input{};
+      auto &mesh = input.mesh;
+      mesh.input_primitive = static_cast<uint32_t>(test.topology);
+      mesh.wave_size = test.wave_size;
+      mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
+      mesh.vertices_per_group =
+          mesh.InputVertexCount(mesh.primitives_per_group);
+      mesh.threads_num[0] = 256;
+      mesh.threads_num[1] = mesh.threads_num[2] = 1;
+      Decoder::Program decoded;
+      CFG::Graph graph;
+      CFG::BasicBlock block;
+      block.id = 0;
+      block.terminator.kind = CFG::TerminatorKind::Return;
+      graph.blocks.push_back(std::move(block));
+      graph.entry_block = 0;
+      Frontend::TranslateOptions options{};
+      options.stage = ShaderType::Mesh;
+      options.wave_size = test.wave_size;
+      options.user_data_count = 0;
+      options.input_info.vertex = &input;
+      auto program = Frontend::TranslateProgram(decoded, graph, options);
+      const uint32_t draw[] = {test.count, test.base_vertex, 7,
+                               test.width, test.address_low, 0x12,
+                               slice_group};
+      Inst *load = nullptr;
+      for (auto &inst : *program.blocks.front()) {
+        if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+          inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+        } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+          const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+          const uint32_t value =
+              kind == StageInputKind::LocalInvocationIndex ? test.lane
+              : inst.Arg(1).U32() == 0 ? test.group - slice_group
+                                       : 2;
+          inst.ReplaceUsesWith(Value(value));
+        } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
+          Check(load == nullptr, "mesh index fetch emitted duplicate loads");
+          load = &inst;
+        }
       }
-    }
-    ConstantPropagationPass(program.blocks);
-    Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
-              load->Arg(3).Resolve().U1() == test.fetch,
-          "mesh index fetch address or active-lane predicate is wrong");
-    const auto *resource = load->Arg(0).ResolveInstruction();
-    Check(resource != nullptr && resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-              resource->Arg(1).Resolve().U32() == 0x12 &&
-              program.memory_info[load->Flags<MemoryFlags>().index].kind == ResourceKind::Global,
-          "mesh index fetch lost its aligned guest address resource");
-    load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
-    ConstantPropagationPass(program.blocks);
-    std::array<uint32_t, 9> vgprs{};
-    uint32_t sgpr3 = 0;
-    for (const auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
-        vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
-      } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgpr3 = inst.Arg(1).Resolve().U32();
+      ConstantPropagationPass(program.blocks);
+      Check(load != nullptr &&
+                load->Arg(1).Resolve().U32() == test.byte_offset &&
+                load->Arg(3).Resolve().U1() == test.fetch,
+            "mesh index fetch address or active-lane predicate is wrong");
+      const auto *resource = load->Arg(0).ResolveInstruction();
+      Check(resource != nullptr &&
+                resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+                resource->Arg(1).Resolve().U32() == 0x12 &&
+                program.memory_info[load->Flags<MemoryFlags>().index].kind ==
+                    ResourceKind::Global,
+            "mesh index fetch lost its aligned guest address resource");
+      load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
+      ConstantPropagationPass(program.blocks);
+      std::array<uint32_t, 9> vgprs{};
+      uint32_t sgpr3 = 0;
+      for (const auto &inst : *program.blocks.front()) {
+        if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
+          vgprs[RegIndex(inst.Arg(0).VectorRegister())] =
+              inst.Arg(1).Resolve().U32();
+        } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
+          sgpr3 = inst.Arg(1).Resolve().U32();
+        }
       }
+      Check(sgpr3 == test.wave_info &&
+                vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+                vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
+                vgprs[8] == 9,
+            "mesh prolog changed input assembly, wave counts, vertex ID, or "
+            "instance ID");
     }
-    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
 

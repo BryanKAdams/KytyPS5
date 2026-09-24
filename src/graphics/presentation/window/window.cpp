@@ -904,7 +904,11 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(bool new_frame) {
+	if (!frame_statistics.Record(Common::Timer::QueryPerformanceCounter(),
+	                             Common::Timer::QueryPerformanceFrequency(), new_frame)) {
+		return;
+	}
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -914,10 +918,6 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -927,23 +927,13 @@ void WindowContext::UpdateTitle() {
 	static constexpr auto build_type = "Unknown";
 #endif
 
-	const auto now       = Common::Timer::QueryPerformanceCounter();
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	frame_num++;
-	fps_frames++;
-	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
-	}
-
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
-	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	auto        text        = fmt::format(
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, game fps: {:.1f}, presents/s: {:.1f}",
+	    KYTY_BUILD_LABEL, build_type, (has_title ? title : ""), (has_title ? ", " : ""),
+	    (has_title_id ? title_id : ""), (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
+	    (has_app_ver ? " " : ""), device_name, processor_name, frame_statistics.TotalFrames(),
+	    frame_statistics.FrameRate(), frame_statistics.PresentRate());
 
 	struct TitleUpdate {
 		SDL_Window*  window;

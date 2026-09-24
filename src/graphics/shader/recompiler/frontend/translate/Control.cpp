@@ -68,13 +68,40 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 		return;
 	}
-	const auto old    = ir.GetExec();
-	const auto src    = ReadMask(inst.src0);
-	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
-	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
-	WriteMask(inst.dst, old, true);
-	const auto mask = BallotMask(result);
+	// Scalar SAVEEXEC operates on every mask bit, including lanes absent from the host
+	// subgroup. Keep the raw words separate from the per-invocation predicate: a ballot
+	// cannot recover those bits after OR/NOT enables them.
+	const auto             old_words   = std::array {ir.GetExecLo(), ir.GetExecHi()};
+	const auto             src_words   = ReadU32Pair(inst.src0);
+	const auto             old         = ir.GetExec();
+	const bool             mask_source = inst.src0.kind == Decoder::OperandKind::Sgpr ||
+	                                     inst.src0.kind == Decoder::OperandKind::ExecLo ||
+	                                     inst.src0.kind == Decoder::OperandKind::VccLo;
+	const auto             src         = mask_source ? ReadMask(inst.src0) : ThreadBit(src_words);
+	const auto             lhs         = negate_exec ? ir.LogicalNot(old) : old;
+	const auto             rhs         = negate_source ? ir.LogicalNot(src) : src;
+	const auto             result      = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	std::array<IR::U32, 2> mask;
+	for (uint32_t component = 0; component < 2u; ++component) {
+		const auto left = negate_exec ? ir.BitwiseNot(old_words[component]) : old_words[component];
+		const auto right =
+		    negate_source ? ir.BitwiseNot(src_words[component]) : src_words[component];
+		switch (operation) {
+			case IR::ValueOpcode::LogicalAnd: mask[component] = ir.BitwiseAnd(left, right); break;
+			case IR::ValueOpcode::LogicalOr: mask[component] = ir.BitwiseOr(left, right); break;
+			default: EXIT("unsupported SAVEEXEC operation");
+		}
+	}
+	WriteU32Pair(inst.dst, old_words);
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+		// Preserve the saved predicate through later mask restores without replacing the
+		// saved scalar bits with a ballot. WriteU32Pair already invalidates overlapping tags.
+		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
+		ir.SetThreadBitScalarReg(dst, old);
+		ir.SetScalarMaskTag(dst, IR::U1(IR::Value(true)));
+	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
+		ir.SetVcc(old);
+	}
 	ir.SetExec(result);
 	ir.SetExecLo(mask[0]);
 	ir.SetExecHi(mask[1]);

@@ -25,6 +25,8 @@ enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+enum class BdaSyncMode { Selective, Legacy, SelectiveChecked };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -45,6 +47,7 @@ struct ConfigOptions {
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	BdaSyncMode            bda_sync_mode                   = BdaSyncMode::Selective;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   vr_enabled                  = false;
@@ -53,6 +56,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   shader_precompile_enabled       = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -82,6 +86,7 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 PresentMode GetPresentMode();
+BdaSyncMode        GetBdaSyncMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     VrEnabled();
@@ -91,6 +96,7 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+bool                   ShaderPrecompileEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

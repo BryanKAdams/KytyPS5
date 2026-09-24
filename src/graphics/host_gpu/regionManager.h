@@ -69,11 +69,14 @@ private:
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
+	              std::atomic<uint64_t>& bda_hint_word)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr), m_bda_hint_word(bda_hint_word),
+	      m_bda_hint_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE) % 64u)) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -85,6 +88,11 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	void                   PublishBdaHint() const noexcept {
+		m_bda_hint_word.fetch_or(m_bda_hint_mask, std::memory_order_release);
+	}
+	// Caller holds lock. This snapshot is only a discovery hint; uploads read the live bits.
+	[[nodiscard]] const RegionBits& CpuDirtyBits() const noexcept { return m_cpu_dirty; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -110,6 +118,11 @@ public:
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			// Publish every write, even if already dirty: a selective pass may have consumed
+			// the previous hint. The caller still holds the region lock while publishing.
+			PublishBdaHint();
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -185,6 +198,8 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	std::atomic<uint64_t>& m_bda_hint_word;
+	uint64_t               m_bda_hint_mask;
 };
 
 } // namespace Libs::Graphics

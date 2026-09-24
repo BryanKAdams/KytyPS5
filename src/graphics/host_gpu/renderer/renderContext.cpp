@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -90,6 +91,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.PublishBdaHints(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -120,9 +122,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	const auto       mode = Config::GetBdaSyncMode();
+	if (mode == Config::BdaSyncMode::Legacy ||
+	    !m_buffer_cache.SynchronizeBdaSelective(m_mapped_ranges)) {
+		m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+	}
+	if (mode == Config::BdaSyncMode::SelectiveChecked) {
+		EXIT_IF(!m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges));
+	}
 	m_fault_process_pending = true;
 }
 

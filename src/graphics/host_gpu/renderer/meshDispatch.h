@@ -1,0 +1,81 @@
+#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MESHDISPATCH_H_
+#define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MESHDISPATCH_H_
+
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
+namespace Libs::Graphics {
+
+struct MeshDispatchSlice {
+	uint32_t group_offset    = 0;
+	uint32_t group_count     = 0;
+	uint32_t instance_offset = 0;
+	uint32_t instance_count  = 0;
+};
+
+/**
+ * @brief Splits a mesh workgroup grid into host-limit-compatible slices.
+ *
+ * Mesh draws are dispatched as `drawMeshTasksEXT(groups, instances, 1)`, and
+ * drivers report per-dimension and total workgroup-count limits that guest
+ * draws can exceed (e.g. an instance count above 65535). This visits the
+ * sub-grids needed to
+ * replay such a draw without exceeding the limits. Each
+ * slice keeps its own group and instance
+ * offsets so the mesh shader's inputs (which derive the primitive range from the group and the
+ * instance from `instance_offset` added to the draw's first instance) remain equivalent to a single
+ * oversized dispatch.
+ *
+ * Hosts are required to report limits of at least one in every dimension.
+ *
+ * @param groups       Mesh workgroup count in the X dimension.
+ * @param instances    Workgroup count in the Y dimension (guest instances).
+ * @param max_groups   Host X-dimension workgroup limit.
+ * @param max_instances Host Y-dimension workgroup limit.
+ * @param max_total    Host total workgroup count limit. Also caps each group
+ *                     slice, since the per-dimension X limit can exceed it.
+ * @param callback     Called for each slice in flattened workgroup order;
+ * not called when either
+ * count is zero.
+ */
+template <typename Callback>
+inline void ForEachMeshDispatch(uint32_t groups, uint32_t instances, uint32_t max_groups,
+                                uint32_t max_instances, uint32_t max_total, Callback&& callback) {
+	if (groups == 0u || instances == 0u) {
+		return;
+	}
+	const uint32_t total_limit  = std::max(1u, max_total);
+	const uint32_t group_stride = std::min(std::max(1u, max_groups), total_limit);
+	// Rasterization orders workgroups by X + Y * width. When X needs splitting,
+	// finish every X chunk of one instance before starting the next instance.
+	// Multiple instances can share a dispatch only when its X range is complete.
+	const uint32_t instance_stride =
+	    groups <= group_stride ? std::min(std::max(1u, max_instances), total_limit / groups) : 1u;
+	// Each loop advances by the count it actually consumed, never by the raw
+	// stride: the strides are host limits that need not divide the guest count,
+	// and adding them directly can wrap a uint32 counter (e.g. groups ==
+	// UINT32_MAX with stride 2 never reaches the terminating value).
+	for (uint32_t instance = 0u; instance < instances;) {
+		const uint32_t instance_count = std::min(instance_stride, instances - instance);
+		for (uint32_t group = 0u; group < groups;) {
+			const uint32_t group_count = std::min(group_stride, groups - group);
+			callback(MeshDispatchSlice {group, group_count, instance, instance_count});
+			group += group_count;
+		}
+		instance += instance_count;
+	}
+}
+
+inline std::vector<MeshDispatchSlice> SplitMeshDispatch(uint32_t groups, uint32_t instances,
+                                                        uint32_t max_groups, uint32_t max_instances,
+                                                        uint32_t max_total) {
+	std::vector<MeshDispatchSlice> slices;
+	ForEachMeshDispatch(groups, instances, max_groups, max_instances, max_total,
+	                    [&slices](const MeshDispatchSlice& slice) { slices.push_back(slice); });
+	return slices;
+}
+
+} // namespace Libs::Graphics
+
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MESHDISPATCH_H_

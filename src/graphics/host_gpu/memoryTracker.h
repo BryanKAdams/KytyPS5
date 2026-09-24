@@ -29,6 +29,24 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+
+	// One conservative hint per tracker region. CPU-dirty bits remain authoritative.
+	// Dirty transitions, region creation, buffer registration and mapping publish hints.
+	// A pass exchanges each word once before inspecting it; publications after that exchange
+	// remain pending. Unfinished regions must be restored, never cleared a second time.
+	static constexpr size_t      BDA_HINT_WORDS = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE / 64;
+	void                         PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	[[nodiscard]] uint64_t       ConsumeBdaHintWord(size_t word) noexcept;
+	void                         RestoreBdaHints(size_t word, uint64_t bits) noexcept;
+	[[nodiscard]] bool           IsBdaHintPending(uint64_t region) const noexcept;
+	[[nodiscard]] RegionManager* FindRegion(uint64_t region) const noexcept {
+		EXIT_IF(region >= REGION_COUNT);
+		return m_regions[region].load(std::memory_order_acquire);
+	}
+	[[nodiscard]] RegionBits SnapshotCpuDirty(RegionManager& manager);
+	// Diagnostic used after a completed selective pass over mapped, registered owners.
+	[[nodiscard]] bool BdaHintsCoverCpuDirty(uint64_t vaddr, uint64_t size);
+
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -151,6 +169,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_hints;
 };
 
 } // namespace Libs::Graphics

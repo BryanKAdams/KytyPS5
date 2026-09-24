@@ -1,0 +1,193 @@
+#include "graphics/host_gpu/renderer/meshDispatch.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_set>
+
+namespace {
+
+using Libs::Graphics::MeshDispatchSlice;
+using Libs::Graphics::SplitMeshDispatch;
+
+void Check(bool value, const char *message) {
+  if (!value) {
+    std::fprintf(stderr, "MeshDispatchTests: failed: %s\n", message);
+    std::abort();
+  }
+}
+
+// Verifies that the slices are within every host limit, do not overlap, and
+// cover the requested grid exactly once in Vulkan's flattened rasterization
+// order.
+void CheckCoverage(const std::vector<MeshDispatchSlice> &slices,
+                   uint32_t groups, uint32_t instances, uint32_t max_groups,
+                   uint32_t max_instances, uint32_t max_total) {
+  std::unordered_set<uint64_t> covered;
+  covered.reserve(static_cast<size_t>(groups) * instances);
+  uint64_t next_flattened_index = 0;
+  for (const auto &slice : slices) {
+    Check(slice.group_count != 0u && slice.instance_count != 0u,
+          "a slice has an empty dimension");
+    Check(slice.group_offset <= groups && slice.instance_offset <= instances &&
+              slice.group_count <= groups - slice.group_offset &&
+              slice.instance_count <= instances - slice.instance_offset,
+          "a slice runs past the requested grid");
+    Check(max_groups == 0u || slice.group_count <= max_groups,
+          "a slice exceeds the group dimension limit");
+    Check(max_instances == 0u || slice.instance_count <= max_instances,
+          "a slice exceeds the instance dimension limit");
+    Check(max_total == 0u ||
+              static_cast<uint64_t>(slice.group_count) * slice.instance_count <=
+                  max_total,
+          "a slice exceeds the total workgroup limit");
+    // A native dispatch rasterizes X first, then Y. Convert each local
+    // workgroup back to the original draw's grid before checking its order.
+    for (uint32_t instance = slice.instance_offset;
+         instance < slice.instance_offset + slice.instance_count; instance++) {
+      for (uint32_t group = slice.group_offset;
+           group < slice.group_offset + slice.group_count; group++) {
+        const auto flattened_index =
+            static_cast<uint64_t>(instance) * groups + group;
+        Check(flattened_index == next_flattened_index++,
+              "slices change flattened workgroup rasterization order");
+        const auto cell = (static_cast<uint64_t>(group) << 32) | instance;
+        Check(covered.insert(cell).second, "slices overlap or repeat a cell");
+      }
+    }
+  }
+  Check(covered.size() == static_cast<size_t>(groups) * instances,
+        "slices do not cover the requested grid exactly once");
+}
+
+void TestWithinLimits() {
+  const auto slices = SplitMeshDispatch(100, 50, 65535, 65535, 65535);
+  Check(slices.size() == 1, "a draw within limits was split");
+  Check(slices[0].group_offset == 0u && slices[0].group_count == 100u &&
+            slices[0].instance_offset == 0u && slices[0].instance_count == 50u,
+        "within-limits slice does not match the draw");
+  CheckCoverage(slices, 100, 50, 65535, 65535, 65535);
+}
+
+void TestInstanceCountAbovePerDimensionLimit() {
+  // Astro's Playroom reports "1x68734" on AMD: one group, 68734 instances,
+  // beyond the 65535 per-dimension limit reported by the host.
+  const auto slices = SplitMeshDispatch(1, 68734, 65535, 65535, 65535);
+  Check(slices.size() == 2u, "oversized instance count did not split");
+  Check(slices[0].group_count == 1u && slices[0].instance_count == 65535u,
+        "first instance slice is wrong");
+  Check(slices[1].instance_offset == 65535u &&
+            slices[1].instance_count == 3199u,
+        "trailing instance slice is wrong");
+  CheckCoverage(slices, 1, 68734, 65535, 65535, 65535);
+}
+
+void TestGroupCountAbovePerDimensionLimit() {
+  const auto slices = SplitMeshDispatch(200000, 7, 65535, 65535, 65535);
+  // Each of seven instances must finish all four X chunks (65535, 65535,
+  // 65535, 3395) before the next instance starts rasterizing.
+  Check(slices.size() == 28u,
+        "oversized group count produced the wrong slice count");
+  CheckCoverage(slices, 200000, 7, 65535, 65535, 65535);
+}
+
+void TestGroupSlicesPreserveInstanceOrder() {
+  // Batching both instances into each X chunk would rasterize global IDs
+  // 0,1,4,5,2,3,6,7 instead of 0,1,2,3,4,5,6,7.
+  const auto slices = SplitMeshDispatch(4, 2, 2, 2, 4);
+  CheckCoverage(slices, 4, 2, 2, 2, 4);
+  Check(slices.size() == 4u,
+        "split X ranges must finish one instance before batching another");
+}
+
+void TestTotalCountCapsInstanceChunks() {
+  const auto slices = SplitMeshDispatch(100, 1000, 65535, 65535, 65535);
+  // The total limit of 65535 allows at most 655 instances per 100-group slice.
+  Check(slices.size() == 2u,
+        "total-limit capping produced the wrong slice count");
+  Check(slices[0].instance_count == 655u && slices[1].instance_count == 345u,
+        "total-limit capping split instances incorrectly");
+  CheckCoverage(slices, 100, 1000, 65535, 65535, 65535);
+}
+
+void TestDegenerateCounts() {
+  Check(SplitMeshDispatch(0, 10, 65535, 65535, 65535).empty(),
+        "zero groups produced a non-empty dispatch");
+  Check(SplitMeshDispatch(10, 0, 65535, 65535, 65535).empty(),
+        "zero instances produced a non-empty dispatch");
+  const auto single = SplitMeshDispatch(1, 1, 65535, 65535, 65535);
+  Check(single.size() == 1u && single[0].group_count == 1u &&
+            single[0].instance_count == 1u,
+        "single-workgroup draw was not preserved");
+}
+
+void TestTotalLimitTighterThanGroupLimit() {
+  // A host can report maxMeshWorkGroupCount[0] above maxMeshWorkGroupTotalCount
+  // (the total constraint is independent per the Vulkan spec). The group chunk
+  // must be clamped to the total limit, or a single slice could exceed it.
+  const auto tighter_groups = SplitMeshDispatch(4, 1, 4, 1, 3);
+  Check(tighter_groups.size() == 2u,
+        "group stride above the total limit was not clamped");
+  CheckCoverage(tighter_groups, 4, 1, 4, 1, 3);
+  const auto mixed = SplitMeshDispatch(6, 2, 4, 2, 3);
+  Check(mixed.size() == 4u, "total-limited slicing is wrong");
+  CheckCoverage(mixed, 6, 2, 4, 2, 3);
+}
+
+void TestZeroAndTinyLimitsClampToOne() {
+  // Hosts must report limits of at least one, but the splitting accepts zero
+  // and treats it as one instead of dividing by zero.
+  const auto one_group = SplitMeshDispatch(4, 1, 0, 0, 0);
+  Check(one_group.size() == 4u, "zero limits did not clamp to one");
+  CheckCoverage(one_group, 4, 1, 0, 0, 0);
+  const auto tiny_limits = SplitMeshDispatch(3, 300, 2, 1, 2);
+  Check(tiny_limits.size() == 600u,
+        "tiny limits produced the wrong slice count");
+  CheckCoverage(tiny_limits, 3, 300, 2, 1, 2);
+}
+
+void TestNonDividingStridesConsumeExactRemainders() {
+  // Strides are host limits that need not divide the guest counts (e.g. a
+  // stride of 2 against odd group/instance counts). Each iteration must
+  // consume exactly the count it covers: with groups or instances == UINT32_MAX
+  // (odd) and a host-reported stride of 2, advancing by the raw stride would
+  // wrap the uint32 counter and loop forever. The full UINT32_MAX input cannot
+  // be enumerated in a unit test, but termination depends on the exact
+  // remainders verified here.
+  const auto slices = SplitMeshDispatch(7, 5, 2, 2, 10);
+  CheckCoverage(slices, 7, 5, 2, 2, 10);
+  const auto &tail = slices.back();
+  Check(tail.group_offset == 6u && tail.group_count == 1u,
+        "trailing group remainder is wrong");
+  bool saw_last_remainder = false;
+  for (const auto &slice : slices) {
+    if (slice.group_offset == 6u && slice.instance_offset == 4u) {
+      Check(slice.instance_count == 1u, "trailing instance remainder is wrong");
+      saw_last_remainder = true;
+    }
+  }
+  Check(saw_last_remainder, "trailing instance remainder is missing");
+
+  // Full-X dispatches still batch instances and must consume their remainder.
+  const auto instance_slices = SplitMeshDispatch(2, 5, 2, 2, 10);
+  CheckCoverage(instance_slices, 2, 5, 2, 2, 10);
+  Check(instance_slices.back().instance_offset == 4u &&
+            instance_slices.back().instance_count == 1u,
+        "batched instances did not consume the exact trailing remainder");
+}
+
+} // namespace
+
+int main() {
+  TestWithinLimits();
+  TestInstanceCountAbovePerDimensionLimit();
+  TestGroupCountAbovePerDimensionLimit();
+  TestGroupSlicesPreserveInstanceOrder();
+  TestTotalCountCapsInstanceChunks();
+  TestDegenerateCounts();
+  TestTotalLimitTighterThanGroupLimit();
+  TestZeroAndTinyLimitsClampToOne();
+  TestNonDividingStridesConsumeExactRemainders();
+  std::puts("MeshDispatchTests: all cases passed");
+  return 0;
+}

@@ -820,6 +820,31 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 	m_num_instances = num_instances;
 }
 
+void CommandProcessor::SynchronizePredicate(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		// Host-only command buffers are also used by the PM4 test harness. Unknown ownership
+		// cannot justify removing the legacy synchronization.
+		BufferFlushAndWait();
+		GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick() - 1);
+		return;
+	}
+	auto&      buffers  = m_renderer.GetBufferCache();
+	auto&      textures = m_renderer.GetTextureCache();
+	const auto sync     = ClassifyPredicateSync(textures.IsRegionGpuModified(address, size),
+	                                            textures.HasPendingDownload(address, size),
+	                                            buffers.IsRegionGpuModified(address, size));
+	if (sync == PredicateSync::Drain) {
+		// Preserve the conservative image path. Queue completion alone does not publish the
+		// CPU backing: the priority runner may still own a freed image's pending writeback.
+		BufferFlushAndWait();
+		GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick() - 1);
+	}
+	if (sync == PredicateSync::Download ||
+	    (sync == PredicateSync::Drain && buffers.IsRegionGpuModified(address, size))) {
+		buffers.ReadMemory(address, size, false);
+	}
+}
+
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
 	(void)count_in_dwords;
@@ -849,10 +874,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			}
 		} break;
 		case 0x03:
-			if (wait_op != 0) {
-				BufferFlushAndWait();
-			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			if (wait_op != 0) {
+				SynchronizePredicate(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
+			}
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);

@@ -4,6 +4,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -11,6 +12,13 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 #include <cerrno>
@@ -60,6 +68,7 @@ struct WaitDeadline {
 	return MakeDeadline(std::chrono::microseconds(*timeout_micros));
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 [[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
 	if (!deadline.finite) {
 		return SIGNAL_POLL_MICROS;
@@ -74,6 +83,7 @@ struct WaitDeadline {
 	    std::chrono::ceil<std::chrono::microseconds>(deadline.end - now).count();
 	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_POLL_MICROS));
 }
+#endif
 
 void PollSignals(signal_poll_func_t signal_poll) {
 	if (signal_poll != nullptr) {
@@ -135,6 +145,137 @@ int WakeLinux(volatile void* address, int32_t count) {
 }
 
 #endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// Park on a private wake word rather than the guest address. A guest signal callback runs
+// between native waits; a Wake during that callback must still release this registered wait.
+// Intrusive stack nodes avoid per-wait allocations, and unrelated addresses use separate locks.
+struct WindowsWaiter {
+	const volatile void* address  = nullptr;
+	WindowsWaiter*       previous = nullptr;
+	WindowsWaiter*       next     = nullptr;
+	uint32_t             woken    = 0;
+};
+
+struct alignas(64) WindowsWaitBucket {
+	SRWLOCK        lock  = SRWLOCK_INIT;
+	WindowsWaiter* first = nullptr;
+	WindowsWaiter* last  = nullptr;
+};
+
+WindowsWaitBucket& WindowsBucketFor(const volatile void* address) {
+	static std::array<WindowsWaitBucket, 256> buckets;
+	auto                                      key = reinterpret_cast<uintptr_t>(address) >> 2u;
+	key ^= key >> 16u;
+	key ^= key >> 8u;
+	return buckets[key & (buckets.size() - 1u)];
+}
+
+class WindowsWaitRegistration {
+public:
+	explicit WindowsWaitRegistration(WindowsWaiter& waiter)
+	    : m_waiter(waiter), m_bucket(WindowsBucketFor(waiter.address)) {
+		AcquireSRWLockExclusive(&m_bucket.lock);
+		waiter.previous = m_bucket.last;
+		if (m_bucket.last != nullptr) {
+			m_bucket.last->next = &waiter;
+		} else {
+			m_bucket.first = &waiter;
+		}
+		m_bucket.last = &waiter;
+		ReleaseSRWLockExclusive(&m_bucket.lock);
+	}
+
+	~WindowsWaitRegistration() { Unregister(); }
+
+	void Unregister() {
+		if (!m_registered) return;
+		// Wake holds this lock until its last access to the node, including the native wake.
+		// Consequently the stack word cannot disappear while another thread still signals it.
+		AcquireSRWLockExclusive(&m_bucket.lock);
+		if (m_waiter.previous != nullptr) {
+			m_waiter.previous->next = m_waiter.next;
+		} else {
+			m_bucket.first = m_waiter.next;
+		}
+		if (m_waiter.next != nullptr) {
+			m_waiter.next->previous = m_waiter.previous;
+		} else {
+			m_bucket.last = m_waiter.previous;
+		}
+		ReleaseSRWLockExclusive(&m_bucket.lock);
+		m_registered = false;
+	}
+
+	WindowsWaitRegistration(const WindowsWaitRegistration&)            = delete;
+	WindowsWaitRegistration& operator=(const WindowsWaitRegistration&) = delete;
+
+private:
+	WindowsWaiter&     m_waiter;
+	WindowsWaitBucket& m_bucket;
+	bool               m_registered = true;
+};
+
+template <typename T>
+int WaitWindows(volatile T* address, T expected, const WaitDeadline& deadline,
+                signal_poll_func_t signal_poll) {
+	if (ReadWord(address) != expected) return OK;
+
+	WindowsWaiter           waiter {.address = address};
+	WindowsWaitRegistration registration(waiter);
+	int                     result = OK;
+	for (;;) {
+		// Recheck after registration: a store/wake racing the initial comparison must not
+		// leave us sleeping. The private word also remembers wakes before WaitOnAddress parks.
+		if (ReadWord(&waiter.woken) != 0 || ReadWord(address) != expected) break;
+
+		DWORD milliseconds = INFINITE;
+		if (deadline.finite) {
+			const auto now = Clock::now();
+			if (now >= deadline.end) {
+				result = KERNEL_ERROR_ETIMEDOUT;
+				break;
+			}
+			const auto remaining =
+			    std::chrono::ceil<std::chrono::milliseconds>(deadline.end - now).count();
+			milliseconds = static_cast<DWORD>(std::min<int64_t>(remaining, INFINITE - 1u));
+		}
+		if (signal_poll != nullptr) {
+			milliseconds = std::min<DWORD>(milliseconds, SIGNAL_POLL_MICROS / 1000u);
+		}
+
+		uint32_t comparison = 0;
+		if (!WaitOnAddress(&waiter.woken, &comparison, sizeof(comparison), milliseconds) &&
+		    GetLastError() != ERROR_TIMEOUT) {
+			result = KERNEL_ERROR_EINVAL;
+			break;
+		}
+		// Native spurious wakes do not consume a guest wake. Callbacks run without a bucket
+		// lock, and any explicit Wake during the callback remains recorded in waiter.woken.
+		PollSignals(signal_poll);
+	}
+	// Serialize timeout completion with counted wakes. A wake that selected this node before
+	// removal must produce success, even when it raced the deadline/error check above.
+	registration.Unregister();
+	return ReadWord(&waiter.woken) != 0 || ReadWord(address) != expected ? OK : result;
+}
+
+int WakeWindows(volatile void* address, int32_t count) {
+	if (count == 0) return OK;
+	auto& bucket = WindowsBucketFor(address);
+	AcquireSRWLockExclusive(&bucket.lock);
+	for (auto* waiter = bucket.first; waiter != nullptr && count != 0; waiter = waiter->next) {
+		if (waiter->address != address || ReadWord(&waiter->woken) != 0) continue;
+		__atomic_store_n(&waiter->woken, 1u, __ATOMIC_RELEASE);
+		WakeByAddressSingle(&waiter->woken);
+		--count;
+	}
+	ReleaseSRWLockExclusive(&bucket.lock);
+	return OK;
+}
+
+#else
 
 struct PortableWaiter {
 	Common::CondVar condition;
@@ -253,6 +394,8 @@ int WakePortable(volatile void* address, int32_t count) {
 	return OK;
 }
 
+#endif
+
 template <typename T>
 int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
@@ -263,6 +406,8 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	result = WaitLinux(address, expected, deadline, signal_poll);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	result = WaitWindows(address, expected, deadline, signal_poll);
 #else
 	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif
@@ -294,8 +439,11 @@ int Wake(volatile void* address, int32_t count) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	return WakeLinux(address, count);
-#endif
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return WakeWindows(address, count);
+#else
 	return WakePortable(address, count);
+#endif
 }
 
 } // namespace Libs::LibKernel::SyncOnAddress

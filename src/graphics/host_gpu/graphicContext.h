@@ -29,7 +29,9 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// Layout support is sufficient for static pipeline feedback flags. Dynamic state is optional.
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                                      attachment_feedback_loop_dynamic_enabled = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;

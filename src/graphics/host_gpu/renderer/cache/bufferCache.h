@@ -69,10 +69,15 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	void               SynchronizeBdaLegacy(const RangeSet& mapped);
+	[[nodiscard]] bool SynchronizeBdaSelective(const RangeSet& mapped);
+	[[nodiscard]] bool CheckBdaHintInvariant(const RangeSet& mapped);
 	void               RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend struct PerformanceMemoryTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
@@ -107,6 +112,9 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
+	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
+	                                          uint64_t begin, uint64_t end);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

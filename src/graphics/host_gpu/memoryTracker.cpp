@@ -9,6 +9,7 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_bda_hints = std::make_unique<std::atomic<uint64_t>[]>(BDA_HINT_WORDS);
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -59,11 +60,77 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
 	}
-	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
+	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE,
+	                                                m_bda_hints[index / 64]);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
+	// New managers start entirely dirty. Publish the hint before the pointer; a consumer
+	// seeing a null pointer uses the full region walk, which waits for creation here.
+	ptr->PublishBdaHint();
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
+}
+
+void MemoryTracker::PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE) {
+		return;
+	}
+	const auto end = vaddr + std::min(size, TRACKER_ADDRESS_SIZE - vaddr);
+	for (auto region = vaddr / TRACKER_REGION_SIZE; region <= (end - 1) / TRACKER_REGION_SIZE;
+	     ++region) {
+		m_bda_hints[region / 64].fetch_or(uint64_t {1} << (region % 64), std::memory_order_release);
+	}
+}
+
+uint64_t MemoryTracker::ConsumeBdaHintWord(size_t word) noexcept {
+	EXIT_IF(word >= BDA_HINT_WORDS);
+	auto& hint = m_bda_hints[word];
+	if (hint.load(std::memory_order_relaxed) == 0) {
+		return 0;
+	}
+	return hint.exchange(0, std::memory_order_acquire);
+}
+
+void MemoryTracker::RestoreBdaHints(size_t word, uint64_t bits) noexcept {
+	EXIT_IF(word >= BDA_HINT_WORDS);
+	if (bits != 0) {
+		m_bda_hints[word].fetch_or(bits, std::memory_order_release);
+	}
+}
+
+bool MemoryTracker::IsBdaHintPending(uint64_t region) const noexcept {
+	return region < REGION_COUNT && (m_bda_hints[region / 64].load(std::memory_order_acquire) &
+	                                 (uint64_t {1} << (region % 64))) != 0;
+}
+
+RegionBits MemoryTracker::SnapshotCpuDirty(RegionManager& manager) {
+	CheckNotInUploadCallback();
+	std::scoped_lock lock(manager.lock);
+	return manager.CpuDirtyBits();
+}
+
+bool MemoryTracker::BdaHintsCoverCpuDirty(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	ValidateRange(vaddr, size);
+	while (size != 0) {
+		const auto region  = vaddr / TRACKER_REGION_SIZE;
+		const auto offset  = vaddr % TRACKER_REGION_SIZE;
+		const auto bytes   = std::min(size, TRACKER_REGION_SIZE - offset);
+		auto*      manager = FindRegion(region);
+		if (manager == nullptr) {
+			if (!IsBdaHintPending(region)) {
+				return false;
+			}
+		} else {
+			std::scoped_lock lock(manager->lock);
+			if (manager->IsModified<DirtySource::Cpu>(offset, bytes) && !IsBdaHintPending(region)) {
+				return false;
+			}
+		}
+		vaddr += bytes;
+		size -= bytes;
+	}
+	return true;
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

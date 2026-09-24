@@ -9,12 +9,16 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -23,12 +27,33 @@ struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
 
+namespace ShaderPrecompile {
+struct PermutationRecord;
+}
+
 namespace HW {
 class Context;
 class Shader;
 class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
+
+// Static feedback flags are ignored by Vulkan when the corresponding dynamic state is enabled.
+// Normalize before cache lookup so dynamic draws share a pipeline across feedback aspects.
+[[nodiscard]] inline vk::PipelineCreateFlags
+AttachmentFeedbackPipelineFlags(vk::ImageAspectFlags aspects, bool dynamic_enabled) {
+	if (dynamic_enabled) {
+		return {};
+	}
+	vk::PipelineCreateFlags flags {};
+	if (aspects & vk::ImageAspectFlagBits::eColor) {
+		flags |= vk::PipelineCreateFlagBits::eColorAttachmentFeedbackLoopEXT;
+	}
+	if (aspects & (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil)) {
+		flags |= vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
+	}
+	return flags;
+}
 
 #pragma pack(push, 1)
 
@@ -56,6 +81,7 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	vk::PipelineCreateFlags    attachment_feedback_loop_flags                     = {};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -65,7 +91,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 125);
+static_assert(sizeof(PipelineStaticParameters) == 129);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -140,11 +166,13 @@ public:
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs,
+	                              vk::ImageAspectFlags    feedback_aspects = {});
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
 private:
+	friend struct AttachmentFeedbackTestAccess;
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {
@@ -215,8 +243,14 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
+	std::jthread                                            m_precompile_thread;
+	std::mutex                                              m_precompile_join_mutex;
+	std::atomic_bool                                        m_precompile_done {true};
 
 	void InitializeDriverCache();
+	void InitializeShaderPrecompile();
+	void WaitForPrecompile();
+	void ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
