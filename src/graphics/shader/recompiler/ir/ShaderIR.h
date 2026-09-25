@@ -518,6 +518,90 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// One ResourcePlan value with identities, invariant phis, extract sources and immediates resolved.
+// Operands are node indices. Evaluation matches SrtWalker, including its failure cases.
+struct ResourceNode {
+	enum class Op : uint8_t {
+		Fail, // Unsupported instruction or immediate type.
+		Const,
+		UserData,   // aux: user-data index relative to ResourcePlan::user_data_base.
+		ShaderBase,
+		Forward,    // Phi invariant, bit cast, or extract of a two-word composite.
+		ReadConst,  // args[0]: SRT slot value; aux: slot.
+		ReadFirstLane, // args[0]: value; args[1]: EXEC mask node or NoNode.
+		RawAddress, // args: low, high, offset; imm: signed immediate offset.
+		RawBuffer,  // args: low, high, offset, records, word3 (NoNode for a malformed handle).
+		ExtractU64, // aux: component.
+		AddCarry,   // args: IAddCarry32 operands; aux: component (sum or carry).
+		ConstructU64,
+		IAdd32,
+		IAdd64,
+		ISub32,
+		ISub64,
+		IMul32,
+		IMul64,
+		UMin32,
+		ConvertF32U32,
+		ConvertU32F32,
+		FPMul32,
+		FPTrunc32,
+		FPIsNan32,
+		FPOrdLessThanEqual32,
+		FPOrdGreaterThanEqual32,
+		BitwiseAnd32,
+		BitwiseAnd64,
+		BitwiseOr32,
+		BitwiseXor32,
+		BitwiseNot32,
+		ShiftLeftLogical32,
+		ShiftLeftLogical64,
+		ShiftRightLogical32,
+		ShiftRightLogical64,
+		ShiftRightArithmetic32,
+		ShiftRightArithmetic64,
+		BitFieldUExtract,
+		BitFieldSExtract,
+		BitFieldInsert,
+		Select,
+		IEqual32,
+		INotEqual32,
+		ULessThan32,
+		UGreaterThan32,
+		SGreaterThanEqual32,
+		LogicalAnd,
+		LogicalOr,
+		LogicalXor,
+		LogicalNot,
+	};
+	static constexpr uint32_t NoNode   = UINT32_MAX;
+	static constexpr uint8_t  CleanSlot = 1u;
+
+	Op                      op    = Op::Fail;
+	uint8_t                 flags = 0;
+	uint32_t                aux   = 0;
+	std::array<uint32_t, 5> args {NoNode, NoNode, NoNode, NoNode, NoNode};
+	uint64_t                imm   = 0;
+};
+
+// Index-based form of a ResourcePlan, built once on the GPU thread before its first refresh.
+struct CompiledResourcePlan {
+	std::vector<ResourceNode>            nodes;
+	std::vector<uint32_t>                slots;       // Node per srt_reads entry.
+	std::vector<uint8_t>                 clean_slots; // Copy of ResourcePlan::clean_flat_slots.
+	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
+	std::vector<uint32_t>                key_counts;     // Indirect images, per descriptor source.
+	std::vector<uint32_t>                selector_masks; // Indirect images, per descriptor source.
+	std::vector<uint32_t>                conditions;     // Per control_flow block.
+	std::array<uint32_t, 4>              fill {ResourceNode::NoNode, ResourceNode::NoNode,
+	                                           ResourceNode::NoNode, ResourceNode::NoNode};
+	// Buffer, image and sampler descriptors are a pure function of these inputs and the active
+	// sources when the plan is memoizable (see MaterializationMemo).
+	bool                  memoizable = false;
+	bool                  memo_shader_base = false;
+	std::vector<uint32_t> memo_user_data; // User-data indices relative to user_data_base.
+	std::vector<uint32_t> memo_slots;     // Flat SRT slots.
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -564,6 +648,7 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	mutable std::unique_ptr<CompiledResourcePlan> compiled;
 };
 
 struct Program: ResourcePlan {

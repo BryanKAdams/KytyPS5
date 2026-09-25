@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <type_traits>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -241,11 +243,35 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
 }
 
-bool MaterializeIndirectImage(const ResourcePlan& program,
+// Plan roots for the Value-based SrtWalker and the node-based SrtEvaluator.
+struct WalkerRoots {
+	using Walker = SrtWalker;
+	const ResourcePlan& program;
+
+	Value Fill(uint32_t index) const { return program.uniform_fill.values[index]; }
+	Value KeyCount(uint32_t source) const {
+		return program.descriptor_sources[source].indirect_image->key_count;
+	}
+	Value SelectorMask(uint32_t source) const {
+		return program.descriptor_sources[source].indirect_image->selector_mask;
+	}
+};
+
+struct CompiledRoots {
+	using Walker = SrtEvaluator;
+	const CompiledResourcePlan& compiled;
+
+	uint32_t Fill(uint32_t index) const { return compiled.fill[index]; }
+	uint32_t KeyCount(uint32_t source) const { return compiled.key_counts[source]; }
+	uint32_t SelectorMask(uint32_t source) const { return compiled.selector_masks[source]; }
+};
+
+template <typename Roots>
+bool MaterializeIndirectImage(const ResourcePlan& program, const Roots& roots, uint32_t source,
                               const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue& material_value,
                               const DescriptorValue& table_value, uint32_t image_index,
-                              const SrtRuntime& runtime, SrtWalker& clean,
+                              const SrtRuntime& runtime, typename Roots::Walker& clean,
                               ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
 	uint64_t table_base = 0;
@@ -263,7 +289,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	keys.clear();
 	if (indirect.material_source == UINT32_MAX) {
 		uint32_t key_count = 0;
-		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
+		const bool evaluated = clean.Evaluate(roots.KeyCount(source), key_count);
 		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
 		if (table_value.dword_count != 2u || !evaluated ||
 		    key_count > MaxIndirectImageProbes ||
@@ -276,8 +302,8 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		uint32_t mask = 0;
 		uint32_t count = 0;
 		if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
-		    !clean.Evaluate(indirect.selector_mask, mask) ||
-		    !clean.Evaluate(indirect.key_count, count) || count == 0u || count > 32u) {
+		    !clean.Evaluate(roots.SelectorMask(source), mask) ||
+		    !clean.Evaluate(roots.KeyCount(source), count) || count == 0u || count > 32u) {
 			return false;
 		}
 		if (count < 32u) mask &= (1u << count) - 1u;
@@ -929,8 +955,12 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+namespace {
+
+bool g_verify_materialization = false;
+
+bool MaterializationAllowed(const ResourcePlan& program, const SrtRuntime& runtime,
+                            bool& capture_reads) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -945,19 +975,145 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.info.images, &ImageResource::written))) {
 		return false;
 	}
-	const bool capture_reads = masked_image &&
+	capture_reads = masked_image &&
 	    std::ranges::any_of(program.info.buffers, &BufferResource::written);
-	auto& reads = program.specialization_reads;
-	ReadCapture capture {runtime, reads};
+	return true;
+}
+
+// Serves one refresh's strict reads from whole 64-byte blocks. Conditions and predicates usually
+// read neighboring SRT or constant-buffer dwords, and each strict read pays for the GPU-dirty
+// checks. A block that cannot be read whole falls back to exact reads.
+class CleanBlockCache {
+public:
+	static constexpr uint64_t BlockBytes = 64;
+
+	explicit CleanBlockCache(const SrtRuntime& source): m_source(source) {}
+
+	// Both readers share SrtRuntime::userdata.
+	SrtRuntime Runtime() {
+		auto runtime                       = m_source;
+		runtime.userdata                   = this;
+		runtime.read_specialization_memory = Read;
+		if (runtime.read_memory != nullptr) {
+			runtime.read_memory = Direct;
+		}
+		return runtime;
+	}
+
+private:
+	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		return static_cast<CleanBlockCache*>(userdata)->Read(address, values);
+	}
+
+	static bool Direct(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		const auto& source = static_cast<CleanBlockCache*>(userdata)->m_source;
+		return source.read_memory(source.userdata, address, values);
+	}
+
+	static constexpr uint32_t BlockWords = BlockBytes / sizeof(uint32_t);
+	static constexpr uint32_t Capacity   = 8;
+
+	struct Block {
+		uint64_t                            address = 0;
+		std::array<uint32_t, BlockWords>    words;
+		bool                                clean = false;
+	};
+
+	bool Exact(uint64_t address, std::span<uint32_t> values) const {
+		return m_source.read_specialization_memory(m_source.userdata, address, values);
+	}
+
+	bool Read(uint64_t address, std::span<uint32_t> values) {
+		const auto block_address = address & ~(BlockBytes - 1u);
+		const auto offset        = address - block_address;
+		if (block_address == 0 || (address & 3u) != 0u || values.empty() ||
+		    values.size_bytes() > BlockBytes - offset) {
+			return Exact(address, values);
+		}
+		Block* block = nullptr;
+		for (uint32_t index = 0; index < m_count; index++) {
+			if (m_blocks[index].address == block_address) {
+				block = &m_blocks[index];
+				break;
+			}
+		}
+		if (block == nullptr) {
+			block  = &m_blocks[m_next];
+			m_next = (m_next + 1u) % Capacity;
+			if (m_count < Capacity) {
+				m_count++;
+			}
+			block->address = block_address;
+			block->clean   = Exact(block_address, block->words);
+		}
+		if (!block->clean) {
+			return Exact(address, values);
+		}
+		std::copy_n(block->words.begin() + offset / sizeof(uint32_t), values.size(),
+		            values.begin());
+		return true;
+	}
+
+	SrtRuntime                   m_source;
+	std::array<Block, Capacity>  m_blocks;
+	uint32_t                     m_count = 0;
+	uint32_t                     m_next  = 0;
+};
+
+SrtRuntime ObservedRuntime(const SrtRuntime& runtime, bool capture_reads, ReadCapture& capture) {
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
-		reads.clear();
+		capture.ranges.clear();
 		observed.userdata = &capture;
 		observed.read_specialization_memory = CaptureStrictRead;
 		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
 	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	return observed;
+}
+
+// Stores the descriptor inputs of a memoizable plan (see CompiledResourcePlan::memoizable) and
+// reports whether a valid key already held them.
+bool UpdateMemoKey(const CompiledResourcePlan& compiled, const SrtRuntime& runtime,
+                   std::span<const uint8_t> active, std::span<const uint32_t> flat,
+                   MaterializationMemo& memo) {
+	const auto size = 2u + (active.size() + 31u) / 32u + (compiled.memo_shader_base ? 2u : 0u) +
+	                  compiled.memo_user_data.size() + compiled.memo_slots.size();
+	auto& key  = memo.key;
+	bool  same = memo.valid && key.size() == size;
+	key.resize(size);
+	auto*      out = key.data();
+	const auto put = [&](uint32_t value) {
+		same &= *out == value;
+		*out++ = value;
+	};
+	put(static_cast<uint32_t>(runtime.user_data.size()));
+	put(static_cast<uint32_t>(active.size()));
+	for (size_t base = 0; base < active.size(); base += 32u) {
+		uint32_t bits = 0;
+		for (size_t index = base; index < active.size() && index < base + 32u; index++) {
+			bits |= static_cast<uint32_t>(active[index] != 0u) << (index - base);
+		}
+		put(bits);
+	}
+	if (compiled.memo_shader_base) {
+		put(static_cast<uint32_t>(runtime.shader_base));
+		put(static_cast<uint32_t>(runtime.shader_base >> 32u));
+	}
+	for (const auto index: compiled.memo_user_data) {
+		put(index < runtime.user_data.size() ? runtime.user_data[index] : 0u);
+	}
+	for (const auto slot: compiled.memo_slots) {
+		put(flat[slot]);
+	}
+	return same;
+}
+
+template <typename Roots>
+bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRuntime& runtime,
+                 const SrtRuntime& observed, bool capture_reads, typename Roots::Walker& clean,
+                 typename Roots::Walker& walker, ResourceSnapshot& snapshot,
+                 ResourceSpecialization& specialization, MaterializationMemo* memo) {
+	auto& reads = program.specialization_reads;
 	const auto active = clean.FindActiveSources();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
@@ -968,11 +1124,25 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		uniform_fill = clean.Evaluate(roots.Fill(i), stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
+	}
+	if constexpr (std::is_same_v<Roots, CompiledRoots>) {
+		if (memo != nullptr) {
+			memo->reused = false;
+			if (roots.compiled.memoizable &&
+			    UpdateMemoKey(roots.compiled, runtime, active, snapshot.flattened_srt, *memo)) {
+				snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+				memo->reused = true;
+				return true;
+			}
+			// The key now holds this refresh's inputs; it becomes valid only if the refresh
+			// succeeds.
+			memo->valid = false;
+		}
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
@@ -1033,8 +1203,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if ((indirect.material_source != UINT32_MAX &&
 			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
 			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
-			    !MaterializeIndirectImage(program, indirect, material, table, i, observed, clean, snapshot,
-			                              specialization)) {
+			    !MaterializeIndirectImage(program, roots, image.source, indirect, material, table,
+			                              i, observed, clean, snapshot, specialization)) {
 				return false;
 			}
 		} else {
@@ -1054,7 +1224,110 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization)) {
+		return false;
+	}
+	if constexpr (std::is_same_v<Roots, CompiledRoots>) {
+		if (memo != nullptr && roots.compiled.memoizable) {
+			memo->valid = true;
+		}
+	}
+	return true;
+}
+
+bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
+                         ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                         MaterializationMemo* memo) {
+	bool capture_reads = false;
+	bool result        = false;
+	if (MaterializationAllowed(program, runtime, capture_reads)) {
+		const auto&  compiled = CompileResourcePlan(program);
+		// Read capture must see exact ranges.
+		CleanBlockCache blocks(runtime);
+		const bool      use_blocks = runtime.specialization_block_reads && !capture_reads &&
+		                        runtime.read_specialization_memory != nullptr;
+		const auto   source = use_blocks ? blocks.Runtime() : runtime;
+		ReadCapture  capture {source, program.specialization_reads};
+		const auto   observed = ObservedRuntime(source, capture_reads, capture);
+		SrtEvaluator clean(program, compiled, CleanRuntime(observed));
+		SrtEvaluator walker(program, compiled, observed, true, &clean);
+		result = Materialize(program, CompiledRoots {compiled}, runtime, observed, capture_reads,
+		                     clean, walker, snapshot, specialization, memo);
+	}
+	if (!result && memo != nullptr) {
+		memo->valid  = false;
+		memo->reused = false;
+	}
+	return result;
+}
+
+void VerifyMaterialization(const ResourcePlan& program, const SrtRuntime& runtime,
+                           const ResourceSnapshot&       snapshot,
+                           const ResourceSpecialization& specialization, bool result,
+                           bool reused) {
+	ResourceSnapshot       expected_snapshot;
+	ResourceSpecialization expected_specialization;
+	const bool             expected = MaterializeResourcesReference(program, runtime,
+	                                                                expected_snapshot,
+	                                                                expected_specialization);
+	const char* field = nullptr;
+	if (expected != result) {
+		field = "result";
+	} else if (!result) {
+		return;
+	} else if (expected_snapshot.buffers != snapshot.buffers) {
+		field = "buffers";
+	} else if (expected_snapshot.images != snapshot.images) {
+		field = "images";
+	} else if (expected_snapshot.samplers != snapshot.samplers) {
+		field = "samplers";
+	} else if (expected_snapshot.flattened_srt != snapshot.flattened_srt) {
+		field = "flattened SRT";
+	} else if (expected_snapshot.user_data != snapshot.user_data) {
+		field = "user data";
+	} else if (expected_snapshot.uniform_fill != snapshot.uniform_fill) {
+		field = "uniform fill";
+	} else if (expected_specialization != specialization) {
+		field = "specialization";
+	}
+	if (field != nullptr) {
+		EXIT("shader resource materialization mismatch: hash=0x%016" PRIx64
+		     " stage=%u field=%s memo=%s\n",
+		     program.shader_hash, static_cast<uint32_t>(program.stage), field,
+		     reused ? "reused" : "evaluated");
+	}
+}
+
+} // namespace
+
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot&       snapshot,
+                                   ResourceSpecialization& specialization) {
+	bool capture_reads = false;
+	if (!MaterializationAllowed(program, runtime, capture_reads)) {
+		return false;
+	}
+	ReadCapture capture {runtime, program.specialization_reads};
+	const auto  observed = ObservedRuntime(runtime, capture_reads, capture);
+	SrtWalker   clean(program, CleanRuntime(observed));
+	SrtWalker   walker(program, observed, program.clean_flat_slots, &clean);
+	return Materialize(program, WalkerRoots {program}, runtime, observed, capture_reads, clean,
+	                   walker, snapshot, specialization, nullptr);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializationMemo* memo) {
+	const bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
+	if (g_verify_materialization) {
+		VerifyMaterialization(program, runtime, snapshot, specialization, result,
+		                      memo != nullptr && memo->reused);
+	}
+	return result;
+}
+
+void SetResourceMaterializationVerification(bool enabled) {
+	g_verify_materialization = enabled;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

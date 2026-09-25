@@ -17,6 +17,9 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// read_specialization_memory succeeds for an aligned, nonzero 64-byte block only when every
+	// dword in it would succeed with the same value, so one refresh may read whole blocks.
+	bool                      specialization_block_reads = false;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -45,8 +48,9 @@ public:
 	std::span<const uint8_t> FindActiveSources();
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
-private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+
+private:
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
@@ -61,6 +65,45 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+};
+
+// Resolves a plan's descriptor, SRT, condition and fill values into index-based nodes. The plan
+// must not be modified afterwards.
+const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program);
+
+// SrtWalker over a CompiledResourcePlan. It keeps SrtWalker's evaluation contexts, clean
+// predicates, EXEC-mask selects and failure semantics, so both produce identical results.
+class SrtEvaluator {
+public:
+	SrtEvaluator(const ResourcePlan& program, const CompiledResourcePlan& compiled,
+	             const SrtRuntime& runtime, bool clean_flat_slots = false,
+	             SrtEvaluator* clean_evaluator = nullptr,
+	             uint32_t      active_mask     = ResourceNode::NoNode);
+	~SrtEvaluator();
+	SrtEvaluator(const SrtEvaluator&)            = delete;
+	SrtEvaluator& operator=(const SrtEvaluator&) = delete;
+
+	bool Evaluate(uint32_t node, uint32_t& result);
+	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// An empty span means that all sources are active.
+	std::span<const uint8_t> FindActiveSources();
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+
+private:
+	bool EvaluateWide(uint32_t node, uint64_t& result);
+	bool EvaluateInst(const ResourceNode& node, uint64_t& result);
+	bool EvaluateRawRead(const ResourceNode& node, uint64_t& result);
+
+	const ResourcePlan&              m_program;
+	const CompiledResourcePlan&      m_compiled;
+	const ResourceNode*              m_nodes;
+	SrtRuntime                       m_runtime;
+	bool                             m_clean_flat_slots = false;
+	SrtEvaluator*                    m_clean_evaluator  = nullptr;
+	uint32_t                         m_active_mask      = ResourceNode::NoNode;
+	ResourcePlan::EvaluationContext& m_context;
+	ResourcePlan::EvaluationContext::Entry* m_memo;
+	uint64_t                         m_generation;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

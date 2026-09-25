@@ -96,6 +96,14 @@ Ways to move work off that thread, cheapest first:
 - **Cheaper per-draw resource materialization** (the 12%): memoize the snapshot per source entry
   when the plan is a pure function of user data and flat SRT slots, or compile the plan into a
   flat evaluation program. Also avoid the texture-cache lock on clean SRT reads.
+  *Done on branch `perf/srt-materialization`:* compiled plans, a per-entry descriptor memo,
+  64-byte clean-read blocks and a last-hit permutation check. See performance-amd.md for the
+  benchmark; the Astro Bot effect is not yet measured.
+- **Shader code hashing per draw:** 305 of the 308 recorded Astro Bot shaders have no declared
+  hash, so `GetShaderParams` (shader.cpp) hashes the whole code (about 4.4 KB, 120-210 ns with
+  XXH3) for every stage of every draw and dispatch. This is the ~5% `GetShaderParams` share in
+  the profile. Caching the hash per registered shader address (invalidated by
+  `ShaderMapUserData`) would remove it, provided games never rewrite registered code in place.
 - **DCC fast-clear materialization without readback.** Remember known fill values;
   `MaterializeDccClear` currently drains whenever the metadata range is GPU-dirty.
 - **Queue-owner submit thread.**

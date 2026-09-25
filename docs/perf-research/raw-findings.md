@@ -971,6 +971,17 @@ Ideas, in order of expected payoff:
 
 Measure with inline-aware symbolization (see "Profiling notes" below) before choosing.
 
+**Status (September 25, branch `perf/srt-materialization`).** The first three ideas are
+implemented; the texture-cache lock itself is untouched, but strict reads now come from 64-byte
+blocks. A replay of the 308-record Astro Bot shader journal (279 distinct plans) gives the plan
+shapes: 157 value nodes, 36 flat SRT slots and 55 descriptor dwords per plan on average; 121
+plans have branch conditions, 37 have selects and none has `ReadFirstLane` or indirect images.
+276 of the 279 plans qualify for the memo. The compiled evaluator matches the walker exactly on
+every plan and on four synthetic memory patterns, and is about 2.9 times faster per refresh.
+Separately, 305 of the 308 shaders have no declared hash, so `GetShaderParams` computes XXH3 over
+about 4.4 KB of code for every stage of every draw. That is the ~5% `GetShaderParams` share above,
+and it becomes the larger per-draw cost once materialization is cheaper.
+
 ### Texture-cache lookups
 
 Per draw: `PrepareDrawRenderState` (renderDraw.cpp:898-935) resolves every MRT slot and the depth
