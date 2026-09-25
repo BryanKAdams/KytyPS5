@@ -2480,6 +2480,22 @@ public:
               cb_db_release_label == 0 &&
               gpu_scheduler.CurrentTick() == cb_db_tick;
 
+          for (const auto gcr : {0u, 1u << 9u}) {
+            const auto before = Sync::ReadReferenceClock();
+            auto timestamp =
+                make_release_mem(3, 0, &cb_db_release_label, UINT64_MAX, 0x14u, gcr);
+            Pm4Execution timestamp_execution;
+            const auto timestamp_result =
+                processor->Process(timestamp_execution, timestamp);
+            Require("GpuCommandLane", "timestamp write",
+                    timestamp_result == Pm4ProcessResult::Complete &&
+                        cb_db_release_label >= before &&
+                        cb_db_release_label <= Sync::ReadReferenceClock() &&
+                        gpu_scheduler.CurrentTick() == cb_db_tick,
+                    "timestamp write failed, returned an invalid time, or "
+                    "submitted extra GPU work");
+          }
+
           auto gds_interrupt_only =
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
           Pm4Execution gds_interrupt_execution;
@@ -2520,6 +2536,14 @@ public:
       bool release_mem_submission_counts = false;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
+
+        const auto clock_before = Sync::ReadReferenceClock();
+        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
+                                     &release_label, UINT64_MAX, 2);
+        Require("GpuCommandLane", "EOP reference clock with interrupt",
+                release_label >= clock_before &&
+                    release_label <= Sync::ReadReferenceClock(),
+                "clock write with writeback and interrupt lost its data");
 
         auto immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
         Pm4Execution immediate_execution;
