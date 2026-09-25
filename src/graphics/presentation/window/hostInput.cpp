@@ -410,21 +410,24 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event) {
-	bool has_event;
+	// Return periodically so the main loop pumps events, and with them queued main-thread
+	// callbacks, even if a wakeup is missed. A presentation thread may be blocked on one of
+	// those callbacks (for example a window-title update). Half a vblank, at least 1 ms.
+	const int main_task_poll_ms = std::max(
+	    1, static_cast<int>(1000u / (2u * std::max(Config::GetVblankFrequency(), 1u))));
+	int timeout_ms = main_task_poll_ms;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
-		has_event = SDL_WaitEvent(event);
-		if (!has_event) {
-			EXIT("%s\n", SDL_GetError());
-		}
 	} else {
 		if (g_mouse.next_poll == 0) {
 			SDL_GetRelativeMouseState(nullptr, nullptr);
 			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
 		}
-		has_event = SDL_WaitEventTimeout(event, PollMouse(SDL_GetTicks()));
+		timeout_ms = std::min(PollMouse(SDL_GetTicks()), main_task_poll_ms);
 	}
+	// SDL3 reports a timeout as false and has no separate error result for this call.
+	const bool has_event = SDL_WaitEventTimeout(event, timeout_ms);
 
 	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
 	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
