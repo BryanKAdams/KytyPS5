@@ -89,6 +89,37 @@ These open upstream PRs were brought in as separate commits that keep their orig
 - **#795, GPU tiler constants:** the tiler shaders avoid `uvec4` specialization-constant selects
   that RADV miscompiled on the RX 9070 XT. The Windows driver already passed the tiler tests.
 
+## GPU drains in Astro Bot
+
+`--drain-stats <seconds>` reports every host wait on the GPU by cause: full drains, waits on
+submitted ticks, readback publication waits, blocked-queue polls, readback counts and DCC
+metadata activity. Each row names the reason (for example a guest-thread read fault, a DCC
+clear check, or a ring wrap) and the PM4 packet being executed. With the flag off, a wait site
+costs one relaxed load.
+
+The first Astro Bot captures (US 01.018, non-RT patch, RX 9070 XT) showed 12-18 ms of full
+drains in each 33-40 ms frame. The largest source was the DCC fast-clear check. The game clears
+its render targets by writing DCC keys from a compute shader every frame, and binding such a
+target read the keys back on the CPU: about 5 full drains, 5-7 ms per frame. Every check found
+a real clear.
+
+**GPU DCC clears:** with `VK_EXT_conditional_rendering`, a small compute pass now checks the
+GPU-written metadata slices, writes one predicate per clear code, and consumes cleared slices.
+The candidate clears run under conditional rendering, so the CPU never waits for the keys. A
+slice is checked again only after a new GPU write to it, and any later lookup of a checked
+slice (for example sampling the target) skips the readback. Textures, video-out surfaces,
+volumes and drivers without conditional rendering keep the CPU path, and `--dcc-gpu-clear false`
+forces it. On the overworld (ship save, same spot, same build and warm caches), the new path ran
+at about 24.5 fps with 13 ms of drains per frame (3 drains), against about 21 fps and 19 ms
+(9 drains) on the CPU path. The fixed-clear GPU test runs Astro Bot's own key-fill shader
+through both paths and requires identical results.
+
+The planet in the overworld shows blotchy dark patches and the background a fine dot pattern.
+Upstream `main` (5a705dd) renders the same artifacts, so they predate this branch.
+
+The largest remaining source is one guest-thread read fault per frame (about 9.5 ms on the
+overworld), followed by the GPU thread reading GPU-written indirect draw arguments.
+
 Reviewed but not ported: #506 (its texture-residency change would raise memory to the pressure
 threshold, where eviction drains the GPU; read-only compute barriers almost never apply; block
 descriptor reads are already in `main`), #767 (duplicates #702 and the dense memo), #628, #484,
@@ -102,6 +133,9 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 --bda-sync SelectiveChecked   Use selective discovery and check remaining dirty-page coverage.
 --shader-precompile true      Default: record and replay compatible shader permutations.
 --shader-precompile false     Disable journal recording/replay for comparison or recovery.
+--dcc-gpu-clear true          Default: apply GPU-written DCC clears on the GPU.
+--dcc-gpu-clear false         Read DCC keys back on the CPU (the previous behavior).
+--drain-stats <seconds>       Report GPU waits by cause every N seconds.
 ```
 
 The driver cache and shader journal require a Release build. They are keyed on a SHA-256 of the

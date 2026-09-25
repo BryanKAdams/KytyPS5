@@ -17,6 +17,21 @@ The guest GPU thread (`Thread_Gpu`, `GuestGpu::ThreadRun`) was the bottleneck:
 
 The CPU and GPU take turns instead of overlapping.
 
+### Measured with `--drain-stats` (September 25)
+
+Per frame in Astro Bot, before the DCC fix:
+
+| Cause | Drains | ms/frame |
+| --- | ---: | ---: |
+| DCC fast-clear check at render-target binding (keys written by a compute shader) | ~5 | 5-7 |
+| Guest-thread read fault | 1 | 1-9 (scene-dependent) |
+| Thread_Gpu reading GPU-written indirect draw arguments | 1-2 | 2-3 |
+| Thread_Gpu fault during a dispatch | 1 | 1-2 |
+
+Every DCC check found a real clear. The DCC drains are now gone (GPU conditional clears, see
+performance-amd.md). On the overworld the guest-thread read fault is the largest remaining
+drain, at about 9.5 ms per frame.
+
 ## Can we have multi-core support?
 
 Mostly, it already exists. Guest x86-64 code runs natively, and every guest pthread is its own
@@ -59,11 +74,10 @@ Ways to move work off that thread, cheapest first:
 - **Fix millisecond-granularity waits on Windows.** `Common::CondVar::WaitFor` rounds sub-ms waits
   up to 1 ms. The blocked-queue poll in `ThreadRun` sleeps 100 ms.
 - **Parallel journal replay.** Uses all cores at startup.
-- **Make the shader journal and driver cache usable in development builds.** They are disabled for
-  uncommitted builds, so tests of performance patches pay full compile cost.
-- **Instrument the drains.** Count full drains per frame, split by caller (fault from a game thread,
-  GPU-thread self-fault, DCC clear, predicate, GDS, GC). The profile could not tell which inner
-  call caused the drains attributed to DMA.
+- **Instrument the drains.** Done: `--drain-stats`.
+- **Make the shader journal and driver cache survive commits.** Done: both are keyed on a hash of
+  the recompiler and pipeline sources.
+- **DCC fast-clear materialization without readback.** Done with conditional rendering.
 
 ### Medium (1-3 weeks)
 
