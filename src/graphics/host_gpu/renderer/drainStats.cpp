@@ -45,12 +45,29 @@ struct FaultSite {
 	uint64_t    ns           = 0;
 	uint64_t    last_address = 0;
 	bool        write        = false;
+	// Read faults: the newest recorded GPU writer of the faulting address.
+	uint64_t    written      = 0; // Faults whose writer is still in the history.
+	uint64_t    frame_age    = 0; // Sum of frames between the write and the fault.
+	uint32_t    writer_op    = NoPm4Op;
 };
 
 // Per-interval fault sites, keyed by faulting instruction and access. Faults that stall are
 // rare (a few per frame), so a mutex is cheap here.
 std::mutex                              g_site_mutex;
 std::unordered_map<uint64_t, FaultSite> g_sites;
+
+struct GpuWrite {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	uint64_t frame = 0;
+	uint32_t op    = NoPm4Op;
+};
+
+// Recent GPU write ranges, newest last. Only read faults search it.
+constexpr size_t      WriteHistory = 16384;
+std::mutex            g_write_mutex;
+std::vector<GpuWrite> g_writes(WriteHistory);
+size_t                g_write_next = 0;
 
 std::mutex                  g_reporter_mutex;
 std::condition_variable_any g_reporter_wake;
@@ -76,6 +93,8 @@ const char* KindName(Kind kind) {
 		case Kind::DccGpuCheck: return "dcc-gpu-check";
 		case Kind::Submit: return "submit";
 		case Kind::QueueLockWait: return "queue-lock-wait";
+		case Kind::IndirectArgsCpu: return "indirect-cpu";
+		case Kind::IndirectArgsGpu: return "indirect-gpu";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -240,6 +259,9 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}ms avg={:.3f}ms\n",
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
 			                    row.count, ms, ms / static_cast<double>(row.count));
+		} else if (row.kind == Kind::IndirectArgsCpu || row.kind == Kind::IndirectArgsGpu) {
+			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} mesh={}\n", KindName(row.kind),
+			                    ReasonName(row.reason), OpName(row.op), row.count, row.value);
 		} else if (row.kind == Kind::DccCheck || row.kind == Kind::DccGpuCheck) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {}={}\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count,
@@ -271,9 +293,16 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 		const auto  pc   = site_keys[site_order[i]] & ~(uint64_t {1} << 63u);
 		const auto  ms   = static_cast<double>(site.ns) / 1e6;
 		text += fmt::format("  fault-site     {:<5} pc={:#014x} thread={:<24} n={:<6} {:8.2f}ms "
-		                    "avg={:.3f}ms addr={:#014x}\n",
+		                    "avg={:.3f}ms addr={:#014x}",
 		                    site.write ? "write" : "read", pc, site.thread, site.count, ms,
 		                    ms / static_cast<double>(site.count), site.last_address);
+		if (site.written != 0) {
+			text += fmt::format(" writer={} known={}/{} age={:.2f}frames", OpName(site.writer_op),
+			                    site.written, site.count,
+			                    static_cast<double>(site.frame_age) /
+			                        static_cast<double>(site.written));
+		}
+		text += '\n';
 	}
 	Log::WriteToConsoleAndLog(text);
 }
@@ -336,8 +365,24 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
 		return;
 	}
 	const auto key = (pc & ~(uint64_t {1} << 63u)) | (write ? uint64_t {1} << 63u : 0);
+	GpuWrite   writer;
+	if (!write) {
+		std::lock_guard lock(g_write_mutex);
+		for (size_t i = 1; i <= WriteHistory; i++) {
+			const auto& entry = g_writes[(g_write_next + WriteHistory - i) % WriteHistory];
+			if (entry.end != 0 && address >= entry.begin && address < entry.end) {
+				writer = entry;
+				break;
+			}
+		}
+	}
 	std::lock_guard lock(g_site_mutex);
 	auto&           site = g_sites[key];
+	if (writer.end != 0) {
+		site.written++;
+		site.frame_age += g_frames.load(std::memory_order_relaxed) - writer.frame;
+		site.writer_op = writer.op;
+	}
 	if (site.count == 0) {
 		char name[64] = "(host thread)";
 		if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -351,6 +396,16 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
 	site.count++;
 	site.ns += ns;
 	site.last_address = address;
+}
+
+void RecordGpuWrite(uint64_t vaddr, uint64_t size) noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	std::lock_guard lock(g_write_mutex);
+	g_writes[g_write_next] = {vaddr, vaddr + size, g_frames.load(std::memory_order_relaxed),
+	                          t_pm4_op};
+	g_write_next = (g_write_next + 1) % WriteHistory;
 }
 
 void CountFrame(bool new_frame) noexcept {

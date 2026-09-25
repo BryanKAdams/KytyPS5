@@ -945,6 +945,14 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	if (DrainStats::Enabled()) {
+		const auto address = m_draw_indirect_args_base_addr + data_offset;
+		const auto size    = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+		const bool gpu     = m_renderer.GetBufferCache().IsRegionGpuModified(address, size);
+		DrainStats::Record(gpu ? DrainStats::Kind::IndirectArgsGpu
+		                       : DrainStats::Kind::IndirectArgsCpu,
+		                   (m_ctx.GetShaderStages() & 0x20u) != 0 ? 1 : 0);
+	}
 
 	if (!indexed) {
 		DrawIndirectArgs args {};

@@ -45,6 +45,8 @@ enum class Kind : uint8_t {
 	DccGpuCheck,   // A DCC lookup checked GPU-written metadata on the GPU; the value is slices.
 	Submit,        // vkQueueSubmit, including the wait for the queue lock; the value is ns.
 	QueueLockWait, // Time a submit waited for the queue lock (held by present or another submit).
+	IndirectArgsCpu, // An indirect draw read CPU-clean args; the value counts mesh-emulated draws.
+	IndirectArgsGpu, // An indirect draw read GPU-written args; the value counts mesh-emulated draws.
 	Count,
 };
 
@@ -70,6 +72,9 @@ void Record(Kind kind, Reason reason, uint32_t pm4_op, uint64_t value) noexcept;
 void CountFrame(bool new_frame) noexcept;
 // A GPU-memory fault stalled the faulting thread for `ns`; keyed by the faulting instruction.
 void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noexcept;
+// A recorded GPU command writes [vaddr, vaddr+size). Read fault sites report the newest such
+// writer of their address and how many frames ago it was recorded.
+void RecordGpuWrite(uint64_t vaddr, uint64_t size) noexcept;
 
 inline void Record(Kind kind, uint64_t value) noexcept {
 	if (Enabled()) {
