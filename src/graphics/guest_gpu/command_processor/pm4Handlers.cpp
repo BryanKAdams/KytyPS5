@@ -2318,7 +2318,14 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		// The label reached guest memory at parse time, so submitting here only paces the GPU.
+		// A queued interrupt needs its tick submitted. A plain label submits only once the GPU
+		// has finished all earlier work; while it is busy, labels batch into fewer submits.
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			cp.BufferFlush();
+		} else {
+			cp.BufferFlushIfGpuIdle();
+		}
 
 		return 7;
 	}

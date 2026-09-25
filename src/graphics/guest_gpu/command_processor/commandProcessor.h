@@ -73,6 +73,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits only when the GPU has retired every earlier submission.
+	void            BufferFlushIfGpuIdle();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }

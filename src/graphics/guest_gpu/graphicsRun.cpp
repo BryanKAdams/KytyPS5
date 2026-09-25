@@ -271,6 +271,13 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+void CommandProcessor::BufferFlushIfGpuIdle() {
+	auto& scheduler = GetScheduler();
+	if (scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+		scheduler.Flush();
+	}
+}
+
 void CommandProcessor::BufferFlushAndWait() {
 	GetScheduler().FlushAndWait();
 }
