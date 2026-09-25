@@ -6,6 +6,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
@@ -67,6 +68,8 @@ public:
 	[[nodiscard]] bool HasPendingDownload(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	// Drain statistics only: native DCC metadata ranges seen by image lookups.
+	[[nodiscard]] bool IsKnownDccMetadata(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
@@ -181,6 +184,7 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	RangeSet                                          m_dcc_metadata_seen;
 	std::mutex                                        m_pending_download_mutex;
 	std::vector<GuestRange>                           m_pending_downloads;
 	uint64_t                                          m_total_used_memory  = 0;

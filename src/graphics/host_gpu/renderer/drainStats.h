@@ -40,6 +40,8 @@ enum class Kind : uint8_t {
 	BlockedPoll,   // Thread_Gpu idles because every queue is suspended.
 	Readback,      // A buffer download was recorded; the value is its size in bytes.
 	ReadbackClean, // ReadMemory found nothing to download.
+	DccMetaWrite,  // A GPU write covered known DCC metadata; the value is its size in bytes.
+	DccCheck,      // A DCC lookup read GPU-written metadata; the value is slices it cleared.
 	Count,
 };
 

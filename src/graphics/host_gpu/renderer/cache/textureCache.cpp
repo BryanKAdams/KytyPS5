@@ -1190,6 +1190,9 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
 		m_surface_metas.erase(range.address);
+		if (DrainStats::Enabled() && range.Valid()) {
+			m_dcc_metadata_seen.Add(range.address, range.size);
+		}
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
 			return;
 		}
@@ -1211,11 +1214,23 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	const bool gpu_written = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	if (gpu_written) {
 		DrainStats::ReasonScope reason(DrainStats::Reason::DccClear);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
+	uint64_t   cleared_slices = 0;
+	const auto slice_size     = range.size / layers;
+	struct CheckRecord {
+		bool      record;
+		uint64_t& cleared;
+		~CheckRecord() {
+			if (record) {
+				DrainStats::ReasonScope reason(DrainStats::Reason::DccClear);
+				DrainStats::Record(DrainStats::Kind::DccCheck, cleared);
+			}
+		}
+	} check_record {gpu_written, cleared_slices};
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1239,6 +1254,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
+		cleared_slices++;
 		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
 		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
 		if (desc.type != BindingType::VideoOut) {
@@ -2039,6 +2055,11 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
+}
+
+bool TextureCache::IsKnownDccMetadata(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return m_dcc_metadata_seen.Intersects(address, size);
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {

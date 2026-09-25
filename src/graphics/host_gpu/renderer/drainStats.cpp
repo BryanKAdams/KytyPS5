@@ -56,6 +56,8 @@ const char* KindName(Kind kind) {
 		case Kind::BlockedPoll: return "blocked-poll";
 		case Kind::Readback: return "readback";
 		case Kind::ReadbackClean: return "readback-clean";
+		case Kind::DccMetaWrite: return "dcc-meta-write";
+		case Kind::DccCheck: return "dcc-check";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -112,8 +114,10 @@ std::string OpName(uint32_t op) {
 		case 0x22: return "COND_EXEC";
 		case 0x24: return "DRAW_INDIRECT";
 		case 0x25: return "DRAW_INDEX_INDIRECT";
+		case 0x27: return "DRAW_INDEX_2";
 		case 0x2C: return "DRAW_INDIRECT_MULTI";
 		case 0x2D: return "DRAW_INDEX_AUTO";
+		case 0x35: return "DRAW_INDEX_OFFSET_2";
 		case 0x37: return "WRITE_DATA";
 		case 0x38: return "DRAW_INDEX_INDIRECT_MULTI";
 		case 0x3C: return "WAIT_REG_MEM";
@@ -205,6 +209,10 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}ms avg={:.3f}ms\n",
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
 			                    row.count, ms, ms / static_cast<double>(row.count));
+		} else if (row.kind == Kind::DccCheck) {
+			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} cleared-slices={}\n",
+			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
+			                    row.count, row.value);
 		} else {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}MiB\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count,
