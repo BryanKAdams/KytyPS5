@@ -19,6 +19,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (Config::AsyncSubmitEnabled()) {
+		// vkQueueSubmit was about 40% of Thread_Gpu in Astro Bot; a queue thread takes it over.
+		m_command_scheduler.EnableAsyncSubmit();
+	}
 }
 
 RenderContext::~RenderContext() {

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 
 #include <queue>
@@ -41,6 +42,10 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Hands later submissions to a dedicated queue thread, which submits them in tick order.
+	// Submit() then returns once the tick is allocated. Host waits on the timeline stay valid
+	// before the submission happens. Enable before the first Submit().
+	void EnableAsyncSubmit();
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -80,8 +85,28 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	// A finished command buffer and everything its vkQueueSubmit needs, including the debug
+	// state for fatal reports and the drain-stats attribution of the submitting thread.
+	struct SubmitJob {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo        submit;
+		uint64_t          tick         = 0;
+		uint32_t          debug_op     = 0;
+		uint64_t          debug_submit = 0;
+		uint32_t          debug_arg0   = 0;
+		uint32_t          debug_arg1   = 0;
+		uint32_t          debug_arg2   = 0;
+		uint32_t          debug_arg3   = 0;
+		uint64_t          debug_arg4   = 0;
+		uint8_t           reason       = 0;
+		uint32_t          pm4_op       = 0;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
+	void SubmitThread(std::stop_token stop);
+	void QueueSubmit(SubmitJob& job);
+	void StopSubmitThread();
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -97,6 +122,12 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	// Asynchronous submission; jobs are queued in tick order by the recording thread.
+	std::mutex                   m_submit_mutex;
+	std::condition_variable_any  m_submit_available;
+	std::deque<SubmitJob>        m_submit_jobs;
+	std::jthread                 m_submit_thread;
+	bool                         m_async_submit = false;
 };
 
 } // namespace Libs::Graphics

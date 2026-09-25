@@ -74,6 +74,7 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	uint32_t               drain_stats_interval        = 0;
 	bool                   dcc_gpu_clear_enabled       = true;
+	bool                   async_submit_enabled        = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -125,6 +126,8 @@ bool PlayGoHackEnabled();
 uint32_t GetDrainStatsInterval();
 // Apply GPU-written DCC fast clears on the GPU instead of reading the keys back.
 bool DccGpuClearEnabled();
+// Submit the GPU thread's command buffers from a dedicated queue thread.
+bool AsyncSubmitEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

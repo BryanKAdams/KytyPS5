@@ -159,6 +159,10 @@ bool DccGpuClearEnabled() {
 	return g_config->dcc_gpu_clear_enabled;
 }
 
+bool AsyncSubmitEnabled() {
+	return g_config->async_submit_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
