@@ -476,7 +476,9 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
                                           specializations[i], &memos[i]);
             break;
           }
-          Require(name, "materialize", ok, "a usable plan stopped materializing");
+          if (!ok) {
+            Fail(name, "materialize", "a usable plan stopped materializing");
+          }
         }
       }
       return std::chrono::duration<double, std::micro>(

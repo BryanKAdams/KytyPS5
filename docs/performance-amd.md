@@ -64,6 +64,24 @@ validated by this patch set.
   transport. Per-call `DONTWAIT` on an otherwise blocking Windows transport remains unsupported
   and returns `EOPNOTSUPP`; an explicitly nonblocking transport supports it.
 
+- **Per-draw shader resource refresh:** `ProgramCache::Get` refreshes every stage's descriptors
+  on every draw and dispatch, including cache hits. Each `ResourcePlan` is now compiled once into
+  index-based nodes, with identities, invariant phis, extract sources and immediates resolved.
+  `SrtEvaluator` evaluates those nodes with the same contexts, clean predicates, EXEC-mask selects
+  and failure cases as `SrtWalker`, but without `Value::Resolve` chains or per-use type dispatch.
+  A per-entry memo skips descriptor evaluation and specialization when a plan's descriptors
+  depend only on user data, the shader base and flat SRT slots, and those inputs and the active
+  sources are unchanged. The flat SRT buffer, user data and uniform fill are still refreshed
+  every time. Plans with dynamic reads, clean-only dependencies, `ReadFirstLane` or indirect
+  images always take the full path; 276 of the 279 distinct Astro Bot plans qualify. Strict
+  (GPU-clean) reads within one refresh are served from whole 64-byte blocks, which cuts
+  `TryReadGpuCleanBacking` calls by about three times; a block that cannot be read whole falls
+  back to exact reads. The permutation search checks the last hit first and is skipped when the
+  memo kept the specialization and the push-data cursor is unchanged. The original walker is
+  kept as `MaterializeResourcesReference`. Setting `KYTY_VERIFY_SRT=1` compares every refresh
+  with it and aborts on a difference, and `KYTY_SRT_STATS=1` logs how often refreshes reuse
+  descriptors.
+
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains
 from this branch.
@@ -214,6 +232,42 @@ workload. That fixed cost made it slower than the full scan below roughly 250 ca
 (32 to 8,192 buffers). The benchmark does not measure dirty uploads, shader cost, GPU execution,
 frame time, or Astro Bot FPS. The GPU identity logged by the harness was `AMD Radeon RX 9070 XT`,
 Vulkan driver value `8389003`.
+
+### Shader resource refresh benchmark
+
+```powershell
+Copy-Item C:\Games\runs\drain\_PipelineCache\PPSA21564.shaders $env:TEMP\astro.shaders
+.\_Build\windows\shader_recompiler_compute_tests.exe --srt-benchmark $env:TEMP\astro.shaders
+```
+
+The benchmark reads a copy of a shader precompile journal. Do not pass the game's live journal:
+the emulator repairs or rewrites that file when it opens it. The benchmark translates every
+distinct shader in the journal and extracts its resource plan. It then checks, on four
+synthetic memory patterns and two user-data sets, that the compiled evaluator and the memo produce
+exactly the reference walker's snapshot and specialization, including which plans fail. Finally
+it times one refresh of every plan per pass: 48 rotating batches of 8 passes per variant, reported
+as the median of batch averages. Memory comes from a fake reader (zeros or a hash of the address),
+so these numbers exclude real guest-memory misses and the real cost of `TryReadGpuCleanBacking`;
+the table below gives the read counts instead. A third argument (seconds) loops the compiled
+path so that a sampling profiler can attach. Do not run it while builds, games or other heavy
+CPU tasks are active.
+
+On September 25, 2026, the 308-record Astro Bot journal (279 distinct plans; 276 memoizable)
+measured on the Ryzen 7 7800X3D:
+
+| Refresh path | Median µs per stage (4 patterns) |
+| --- | ---: |
+| Reference `SrtWalker` (before) | 4.04-4.21 |
+| Compiled evaluator | 1.39-1.45 |
+| Compiled + memo, unchanged inputs | 1.02-1.10 |
+| Compiled + memo, inputs change every call | 1.43-1.51 |
+
+Both paths made the same 9,972 direct reads per pass. Strict reads fell from 724-1,147
+to 140-395 per pass with 64-byte blocks. The memo costs about 3% when every refresh misses, so it
+pays off once more than about 12% of refreshes reuse descriptors; `KYTY_SRT_STATS=1` reports the
+game's actual rate. The benchmark also reports that 305 of 308 records have no declared hash, so
+`GetShaderParams` hashes their code (4.4 KB average, about 120-210 ns with XXH3) on every lookup.
+It does not measure permutation search, key building, GPU execution, frame time, or Astro Bot FPS.
 
 ## Remaining rendering work
 

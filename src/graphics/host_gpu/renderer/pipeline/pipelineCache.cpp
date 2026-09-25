@@ -307,6 +307,9 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    source.resource_plan, runtime, source.resources, source.specialization,
 			    &source.memo));
+			if (stats_enabled) {
+				CountRefresh(source);
+			}
 			const auto matches = [&](const Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
 				return layout.push_data_start_dword ==
@@ -415,11 +418,28 @@ struct PipelineCache::ProgramCache {
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
-		// Debugging aid: KYTY_VERIFY_SRT=1 checks every cached resource refresh against the
-		// reference SRT walker and aborts on a difference.
-		if (const char* verify = std::getenv("KYTY_VERIFY_SRT");
-		    verify != nullptr && std::strcmp(verify, "1") == 0) {
+		// Debugging aids: KYTY_VERIFY_SRT=1 checks every cached resource refresh against the
+		// reference SRT walker and aborts on a difference; KYTY_SRT_STATS=1 logs how often
+		// refreshes reuse descriptors.
+		const auto enabled = [](const char* name) {
+			const char* value = std::getenv(name);
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		};
+		if (enabled("KYTY_VERIFY_SRT")) {
 			ShaderRecompiler::IR::SetResourceMaterializationVerification(true);
+		}
+		stats_enabled = enabled("KYTY_SRT_STATS");
+	}
+
+	void CountRefresh(const SourceEntry& source) {
+		constexpr uint64_t Interval = 100000;
+		stats.refreshes++;
+		stats.memoizable += source.resource_plan.compiled != nullptr &&
+		                    source.resource_plan.compiled->memoizable;
+		stats.reused += source.memo.reused;
+		if (stats.refreshes % Interval == 0) {
+			PipelineCacheLog("Shader resources: {} refreshes, {} memoizable, {} reused descriptors",
+			                 stats.refreshes, stats.memoizable, stats.reused);
 		}
 	}
 	~ProgramCache() {
@@ -436,6 +456,12 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 	ShaderPrecompile::Journal                                   recording;
+	bool                                                        stats_enabled = false;
+	struct {
+		uint64_t refreshes  = 0;
+		uint64_t memoizable = 0;
+		uint64_t reused     = 0;
+	} stats;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
