@@ -578,6 +578,11 @@ constexpr u32 InlineU32(u32 value) { return 128u + value; }
 
 constexpr u32 Vgpr(u32 reg) { return 256u + reg; }
 
+bool SoftwareGpuAllowed() {
+  const char *value = std::getenv("KYTY_TEST_SOFTWARE_GPU");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
 constexpr u32 EncodeSMovB32(u32 dst, u32 src) {
   return 0x80000000u | (0x7du << 23u) | ((dst & 0x7fu) << 16u) | (0x03u << 8u) |
          (src & 0xffu);
@@ -15831,7 +15836,10 @@ private:
           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
           features.pNext = &barycentric;
           physical.getFeatures2(&features);
-          if (barycentric.fragmentShaderBarycentric != true ||
+          // KYTY_TEST_SOFTWARE_GPU=1 accepts devices without barycentrics or compute
+          // derivatives, such as Mesa lavapipe. Shaders that need them fail; the
+          // scheduler, cache and readback groups remain runnable without a GPU.
+          if ((barycentric.fragmentShaderBarycentric != true && !SoftwareGpuAllowed()) ||
               features.features.shaderInt64 != true ||
               features12.bufferDeviceAddress != true) {
             continue;
@@ -15864,8 +15872,10 @@ private:
     available_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
     available_features13.pNext = &available_features12;
+    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
+    available_barycentric.pNext = &available_features13;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR available_derivatives{};
-    available_derivatives.pNext = &available_features13;
+    available_derivatives.pNext = &available_barycentric;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT available_depth_clip{};
     available_depth_clip.pNext = &available_derivatives;
     vk::PhysicalDeviceDepthClipControlFeaturesEXT available_clip_control{};
@@ -15887,10 +15897,15 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
+    m_barycentric_supported = available_barycentric.fragmentShaderBarycentric == true;
+    m_derivatives_supported = available_derivatives.computeDerivativeGroupQuads == true;
     Require("VulkanHarness", "dispatch",
             available_features.shaderImageGatherExtended == true &&
-                available_derivatives.computeDerivativeGroupQuads == true,
+                (m_derivatives_supported || SoftwareGpuAllowed()),
             "image gather or compute derivative quads are not supported");
+    Require("VulkanHarness", "dispatch",
+            m_barycentric_supported || SoftwareGpuAllowed(),
+            "fragment shader barycentrics are not supported");
     Require("VulkanHarness", "dispatch",
             available_features12.timelineSemaphore == true,
             "timeline semaphores are not supported");
@@ -15908,7 +15923,8 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
-    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
+    m_min_lod_supported = available_min_lod.minLod == true;
+    Require("VulkanHarness", "dispatch", m_min_lod_supported || SoftwareGpuAllowed(),
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
@@ -15984,14 +16000,18 @@ private:
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
-    device_features13.pNext = &barycentric;
+    device_features13.pNext = m_barycentric_supported
+                                  ? static_cast<void *>(&barycentric)
+                                  : static_cast<void *>(&device_features12);
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
-    depth_clip.pNext = &derivatives;
+    depth_clip.pNext = m_derivatives_supported
+                           ? static_cast<void *>(&derivatives)
+                           : static_cast<void *>(&device_features13);
     depth_clip.depthClipEnable = true;
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
     clip_control.pNext = &depth_clip;
@@ -16023,7 +16043,7 @@ private:
       min_lod.pNext = &provoking_vertex;
     }
     min_lod.minLod = true;
-    device_info.pNext = &min_lod;
+    device_info.pNext = m_min_lod_supported ? &min_lod : min_lod.pNext;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -16042,12 +16062,18 @@ private:
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME};
+    if (m_min_lod_supported) {
+      device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    }
+    if (m_derivatives_supported) {
+      device_extensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    }
+    if (m_barycentric_supported) {
+      device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    }
     if (m_feedback_loop_supported) {
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -16386,6 +16412,9 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
+  bool m_barycentric_supported = false;
+  bool m_derivatives_supported = false;
+  bool m_min_lod_supported = false;
   bool m_feedback_loop_supported = false;
   bool m_feedback_dynamic_supported = false;
   bool m_provoking_vertex_supported = false;
