@@ -110,8 +110,13 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	// Records downloads of the range's unarmed GPU-dirty pages, arms them, and queues their
+	// publication, which finalizes them. Returns false when there was nothing to arm.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Thread_Gpu: arms the readback window around [vaddr, vaddr+size).
+	void RecordReadback(uint64_t vaddr, uint64_t size, bool is_write);
+	// Other threads: publish GPU-dirty pages without draining Thread_Gpu.
+	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write);
 	[[nodiscard]] bool SynchronizeBdaWord(size_t word, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
@@ -137,6 +142,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	uint64_t m_readback_token     = 0;
 };
 
 } // namespace Libs::Graphics

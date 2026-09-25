@@ -30,6 +30,16 @@ public:
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 
+	// Asynchronous readback. A recorded download arms the GPU-dirty pages it copies with a unique
+	// token and its publication tick; the publication callback finalizes (un-dirties) only pages
+	// still armed with its token. Any GPU-dirty transition in between disarms the page, so a GPU
+	// write recorded after the download is never lost. Armed pages stay GPU-dirty (NoAccess)
+	// until finalized, and waiters use their tick instead of draining the GPU.
+	[[nodiscard]] ReadbackState QueryReadback(uint64_t vaddr, uint64_t size);
+	void ArmReadback(uint64_t vaddr, uint64_t size, uint64_t token, uint64_t tick);
+	void FinalizeReadback(uint64_t vaddr, uint64_t size, uint64_t token);
+	[[nodiscard]] bool HasArmedPages(uint64_t vaddr, uint64_t size);
+
 	// One conservative hint per tracker region. CPU-dirty bits remain authoritative.
 	// Dirty transitions, region creation, buffer registration and mapping publish hints.
 	// A pass exchanges each word once before inspecting it; publications after that exchange
@@ -85,6 +95,17 @@ public:
 	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
+
+	// Runs of GPU-dirty pages whose bytes no recorded download covers yet.
+	template <typename Func>
+	void ForEachUnarmedDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->ForEachUnarmedGpuRange(manager->GetCpuAddr() + offset, bytes, func);
+		});
+	}
 
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
@@ -177,6 +198,8 @@ private:
 	PageManager&                                   m_page_manager;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_hints;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_summary;
+	// Pages armed by recorded downloads across all regions; zero lets queries skip the walk.
+	std::atomic<int64_t>                           m_armed_pages {0};
 };
 
 } // namespace Libs::Graphics

@@ -38,6 +38,10 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
 		const bool has_dirty_bytes = dirty.Intersects(page, TRACKER_PAGE_SIZE);
+		// Armed pages stay GPU-dirty after their bytes were recorded for download.
+		if (!has_dirty_bytes && HasArmedPages(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
 		if (IsRegionGpuModified(page, TRACKER_PAGE_SIZE) != has_dirty_bytes) {
 			EXIT("MemoryTracker: tracker and byte ownership disagree, operation=%s "
 			     "addr=0x%016" PRIx64 "\n",
@@ -63,7 +67,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	}
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE,
 	                                                m_bda_hints[index / 64],
-	                                                m_bda_summary[index / 64 / 64]);
+	                                                m_bda_summary[index / 64 / 64], m_armed_pages);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	// New managers start entirely dirty. Publish the hint before the pointer; a consumer
@@ -199,6 +203,43 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+ReadbackState MemoryTracker::QueryReadback(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	ReadbackState state;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->QueryReadback(manager->GetCpuAddr() + offset, bytes, state);
+	});
+	return state;
+}
+
+void MemoryTracker::ArmReadback(uint64_t vaddr, uint64_t size, uint64_t token, uint64_t tick) {
+	CheckNotInUploadCallback();
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->Arm(manager->GetCpuAddr() + offset, bytes, token, tick);
+	});
+}
+
+void MemoryTracker::FinalizeReadback(uint64_t vaddr, uint64_t size, uint64_t token) {
+	CheckNotInUploadCallback();
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->Finalize(manager->GetCpuAddr() + offset, bytes, token);
+	});
+}
+
+bool MemoryTracker::HasArmedPages(uint64_t vaddr, uint64_t size) {
+	if (m_armed_pages.load(std::memory_order_relaxed) == 0) {
+		return false;
+	}
+	CheckNotInUploadCallback();
+	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return manager->HasArmed(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 

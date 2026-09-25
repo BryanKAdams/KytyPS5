@@ -113,13 +113,16 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
-	m_memory_tracker.ForEachDownloadRange<false>(
+	std::vector<vk::BufferCopy>                copies;
+	std::vector<std::pair<uint64_t, uint64_t>> pages;
+	uint64_t                                   total_size     = 0;
+	const auto                                 buffer_address = buffer.CpuAddress();
+	// Pages armed by an earlier download already have their bytes in flight.
+	m_memory_tracker.ForEachUnarmedDownloadRange(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
+		    pages.emplace_back(address, bytes);
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
@@ -127,8 +130,28 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
-	if (copies.empty()) {
+	if (pages.empty()) {
 		return false;
+	}
+	// Arm after any ring wrap (which can submit and move the tick) and before queueing the
+	// publication, which may run inline during shutdown. Waiters only wait on submitted ticks,
+	// so they cannot observe an arm before its publication is queued.
+	const auto token = ++m_readback_token;
+	const auto arm   = [this, &pages, token] {
+		for (const auto& [address, bytes]: pages) {
+			m_memory_tracker.ArmReadback(address, bytes, token, m_scheduler.CurrentTick());
+		}
+	};
+	if (copies.empty()) {
+		// Dirty pages without recorded bytes carry nothing to copy; their publication only
+		// ends their GPU ownership.
+		arm();
+		m_scheduler.DeferPriorityOperation([this, token, pages = std::move(pages)] {
+			for (const auto& [address, bytes]: pages) {
+				m_memory_tracker.FinalizeReadback(address, bytes, token);
+			}
+		});
+		return true;
 	}
 	DrainStats::Record(DrainStats::Kind::Readback, total_size);
 
@@ -178,14 +201,21 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([download, owner = std::move(temporary), mapped, offset,
-	                                    total_size, buffer_address, copies = std::move(copies)] {
+	arm();
+	m_scheduler.DeferPriorityOperation([this, token, pages = std::move(pages), download,
+	                                    owner = std::move(temporary), mapped, offset, total_size,
+	                                    buffer_address, copies = std::move(copies)] {
 		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 		(void)owner; // Retain dedicated staging through the final backing write.
+		// The backing holds the GPU bytes now; pages still armed by this download become
+		// accessible. A page re-dirtied meanwhile keeps its protection for the next download.
+		for (const auto& [address, bytes]: pages) {
+			m_memory_tracker.FinalizeReadback(address, bytes, token);
+		}
 	});
 	return true;
 }
@@ -242,8 +272,38 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	// A CPU write needs the whole range CPU-dirty. GPU-dirty pages are published first; a GPU
+	// write recorded while this thread waits can re-dirty a page, so repeat until all are marked.
+	for (;;) {
+		bool gpu_dirty = false;
+		m_memory_tracker.InvalidateRegion(vaddr, size, [&gpu_dirty] { gpu_dirty = true; });
+		if (!gpu_dirty) {
+			return;
+		}
+		ReadMemory(vaddr, size, true);
+	}
+}
+
+void BufferCache::RecordReadback(uint64_t vaddr, uint64_t size, bool is_write) {
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+			EXIT("BufferCache: GPU-dirty memory has no buffer owner, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     vaddr, size);
+		}
+		return;
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+	// Widen nearby CPU reads so they share one publication.
+	constexpr uint64_t WindowSize   = 512 * 1024;
+	const auto         buffer_begin = buffer.CpuAddress();
+	const auto         buffer_end   = buffer_begin + buffer.Size();
+	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		DrainStats::Record(DrainStats::Kind::ReadbackClean, 0);
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -252,33 +312,60 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	const auto reason = DrainStats::CurrentReason();
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason] {
-		DrainStats::ReasonScope reason_scope(reason);
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	if (!GuestGpu::IsGpuThread()) {
+		ReadMemoryAsync(vaddr, size, is_write);
+		return;
+	}
+	// Thread_Gpu consumes the bytes itself, so it waits here. Pages armed by an earlier
+	// (already submitted) download only need their own tick, which is not a full drain.
+	RecordReadback(vaddr, size, is_write);
+	const auto state = m_memory_tracker.QueryReadback(vaddr, size);
+	if (state.gpu_dirty) {
+		EXIT_IF(state.unarmed);
+		m_scheduler.Wait(state.tick);
+		m_scheduler.WaitPriorityOperations(state.tick);
+	}
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+}
 
-		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
-		const auto         buffer_begin = buffer.CpuAddress();
-		const auto         buffer_end   = buffer_begin + buffer.Size();
-		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
-
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-		} else {
-			DrainStats::Record(DrainStats::Kind::ReadbackClean, 0);
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
-	});
+void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) {
+	// Thread_Gpu only records and submits the download; this thread waits for its own
+	// publication while Thread_Gpu keeps working. The caller retries the access afterwards:
+	// a page the GPU re-dirtied meanwhile simply faults again.
+	auto     state = m_memory_tracker.QueryReadback(vaddr, size);
+	uint64_t tick  = state.gpu_dirty ? state.tick : 0;
+	if (!state.gpu_dirty) {
+		return;
+	}
+	if (state.unarmed || tick >= m_scheduler.CurrentTick()) {
+		const auto reason = DrainStats::CurrentReason();
+		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason, &tick] {
+			DrainStats::ReasonScope reason_scope(reason);
+			RecordReadback(vaddr, size, is_write);
+			const auto current = m_memory_tracker.QueryReadback(vaddr, size);
+			if (!current.gpu_dirty) {
+				tick = 0;
+				return;
+			}
+			EXIT_IF(current.unarmed);
+			tick = current.tick;
+			// A foreign thread may only wait on submitted ticks: nothing else is guaranteed
+			// to submit the open command buffer while guest work waits on this thread.
+			if (tick >= m_scheduler.CurrentTick()) {
+				m_scheduler.Flush();
+			}
+		});
+	}
+	if (tick == 0) {
+		return;
+	}
+	{
+		DrainStats::WaitTimer wait(DrainStats::Kind::TickWait);
+		m_scheduler.GetMasterSemaphore().Wait(tick);
+	}
+	m_scheduler.WaitPriorityOperations(tick);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -595,7 +682,9 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Armed pages have left the byte set but their backing is not published yet.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       m_memory_tracker.HasArmedPages(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -628,7 +717,9 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
+			// Pages armed by an in-flight readback publish with the wait below.
+			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()) &&
+			        !m_memory_tracker.HasArmedPages(buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());

@@ -420,6 +420,82 @@ void TestGpuDirtyBits() {
   Release(memory);
 }
 
+void TestReadbackArming() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](uint64_t index) { return address + index * page_size; };
+
+  tracker.ForEachUploadRange(
+      address, page_size * 3, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  auto state = tracker.QueryReadback(address, page_size * 3);
+  Check(state.gpu_dirty && state.unarmed && state.tick == 0 &&
+            !tracker.HasArmedPages(address, page_size * 3),
+        "fresh GPU-dirty pages reported an armed readback");
+
+  tracker.ArmReadback(address, page_size * 2, 1, 5);
+  state = tracker.QueryReadback(address, page_size * 2);
+  Check(state.gpu_dirty && !state.unarmed && state.tick == 5 &&
+            tracker.HasArmedPages(page(1), page_size) &&
+            !tracker.HasArmedPages(page(2), page_size),
+        "arming did not cover exactly the requested pages");
+  std::vector<std::pair<uint64_t, uint64_t>> unarmed;
+  tracker.ForEachUnarmedDownloadRange(
+      address, page_size * 3, [&](uint64_t start, uint64_t bytes) noexcept {
+        unarmed.emplace_back(start, bytes);
+      });
+  Check(unarmed.size() == 1 && unarmed[0].first == page(2) &&
+            unarmed[0].second == page_size,
+        "armed pages were offered for a second download");
+
+  // A later download arms only what is still unarmed; earlier arms keep their token.
+  tracker.ArmReadback(address, page_size * 3, 2, 6);
+  state = tracker.QueryReadback(address, page_size);
+  Check(!state.unarmed && state.tick == 5 &&
+            tracker.QueryReadback(page(2), page_size).tick == 6,
+        "re-arming replaced an earlier download's token");
+
+  // A GPU write recorded after the download supersedes it.
+  tracker.MarkRegionAsGpuModified(page(1) + 16, 16);
+  state = tracker.QueryReadback(page(1), page_size);
+  Check(state.gpu_dirty && state.unarmed && !tracker.HasArmedPages(page(1), page_size),
+        "a new GPU write did not disarm its page");
+
+  tracker.FinalizeReadback(address, page_size * 3, 1);
+  Check(!tracker.IsRegionGpuModified(page(0), page_size) &&
+            Protection(memory) == PAGE_READONLY &&
+            tracker.IsRegionGpuModified(page(1), page_size) &&
+            Protection(memory + page_size) == PAGE_NOACCESS &&
+            tracker.IsRegionGpuModified(page(2), page_size) &&
+            tracker.HasArmedPages(page(2), page_size),
+        "finalizing published a re-dirtied page or another download's page");
+
+  tracker.FinalizeReadback(page(2), page_size, 2);
+  Check(!tracker.IsRegionGpuModified(page(2), page_size) &&
+            Protection(memory + page_size * 2) == PAGE_READONLY &&
+            !tracker.HasArmedPages(address, page_size * 3),
+        "finalizing the matching token did not publish its page");
+
+  // An explicit unmark also drops arms, so the armed-page count returns to zero.
+  tracker.ArmReadback(page(1), page_size, 3, 7);
+  tracker.UnmarkRegionAsGpuModified(page(1), page_size);
+  Check(!tracker.HasArmedPages(address, page_size * 3) &&
+            !tracker.QueryReadback(address, page_size * 3).gpu_dirty,
+        "unmarking left an armed page behind");
+  tracker.FinalizeReadback(page(1), page_size, 3);
+  Check(!tracker.IsRegionGpuModified(page(1), page_size) &&
+            Protection(memory + page_size) == PAGE_READONLY,
+        "a stale publication changed an unmarked page");
+
+  tracker.MarkRegionAsCpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
+  Release(memory);
+}
+
 void TestExactDirtyIntervalsSharingTrackerPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1166,6 +1242,7 @@ int main(int argc, char **argv) {
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
+  TestReadbackArming();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
