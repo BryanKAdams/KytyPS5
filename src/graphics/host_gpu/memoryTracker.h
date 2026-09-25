@@ -34,10 +34,16 @@ public:
 	// Dirty transitions, region creation, buffer registration and mapping publish hints.
 	// A pass exchanges each word once before inspecting it; publications after that exchange
 	// remain pending. Unfinished regions must be restored, never cleared a second time.
+	// Summary words hold one bit per hint word, so a pass with nothing dirty reads 64 words
+	// instead of 4096. A pass exchanges a summary word before the hint words it flags.
 	static constexpr size_t      BDA_HINT_WORDS = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE / 64;
+	static constexpr size_t      BDA_SUMMARY_WORDS = BDA_HINT_WORDS / 64;
 	void                         PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	[[nodiscard]] uint64_t       ConsumeBdaSummaryWord(size_t summary) noexcept;
+	void                         RestoreBdaSummary(size_t summary, uint64_t words) noexcept;
 	[[nodiscard]] uint64_t       ConsumeBdaHintWord(size_t word) noexcept;
 	void                         RestoreBdaHints(size_t word, uint64_t bits) noexcept;
+	// Pending means the next pass will find the region: both its hint and summary bits are set.
 	[[nodiscard]] bool           IsBdaHintPending(uint64_t region) const noexcept;
 	[[nodiscard]] RegionManager* FindRegion(uint64_t region) const noexcept {
 		EXIT_IF(region >= REGION_COUNT);
@@ -170,6 +176,7 @@ private:
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_hints;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_summary;
 };
 
 } // namespace Libs::Graphics

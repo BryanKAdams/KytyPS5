@@ -671,7 +671,11 @@ void BufferCache::PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept {
 }
 
 void BufferCache::SynchronizeBdaLegacy(const RangeSet& mapped) {
-	// Clear before the full walk so writes racing with the walk stay pending.
+	// Clear before the full walk so writes racing with the walk stay pending. Summaries go
+	// first: a hint published in between re-sets its summary bit for the next pass.
+	for (size_t summary = 0; summary < MemoryTracker::BDA_SUMMARY_WORDS; ++summary) {
+		(void)m_memory_tracker.ConsumeBdaSummaryWord(summary);
+	}
 	for (size_t word = 0; word < MemoryTracker::BDA_HINT_WORDS; ++word) {
 		(void)m_memory_tracker.ConsumeBdaHintWord(word);
 	}
@@ -680,22 +684,41 @@ void BufferCache::SynchronizeBdaLegacy(const RangeSet& mapped) {
 }
 
 bool BufferCache::SynchronizeBdaSelective(const RangeSet& mapped) {
-	for (size_t word = 0; word < MemoryTracker::BDA_HINT_WORDS; ++word) {
-		uint64_t bits = m_memory_tracker.ConsumeBdaHintWord(word);
-		struct Claim {
+	for (size_t summary = 0; summary < MemoryTracker::BDA_SUMMARY_WORDS; ++summary) {
+		uint64_t words = m_memory_tracker.ConsumeBdaSummaryWord(summary);
+		// On failure, words not yet visited keep their hint bits; restore their summary bits.
+		struct SummaryClaim {
 			MemoryTracker& tracker;
-			size_t         word;
+			size_t         summary;
 			uint64_t&      remaining;
-			~Claim() { tracker.RestoreBdaHints(word, remaining); }
-		} claim {m_memory_tracker, word, bits};
-		while (bits != 0) {
-			const auto region = word * 64 + static_cast<size_t>(std::countr_zero(bits));
-			if (!SynchronizeBdaRegion(region, mapped)) {
+			~SummaryClaim() { tracker.RestoreBdaSummary(summary, remaining); }
+		} summary_claim {m_memory_tracker, summary, words};
+		while (words != 0) {
+			const auto word = summary * 64 + static_cast<size_t>(std::countr_zero(words));
+			if (!SynchronizeBdaWord(word, mapped)) {
 				return false;
 			}
-			// Do not touch the shared word again: a concurrent write may have republished it.
-			bits &= bits - 1;
+			words &= words - 1;
 		}
+	}
+	return true;
+}
+
+bool BufferCache::SynchronizeBdaWord(size_t word, const RangeSet& mapped) {
+	uint64_t bits = m_memory_tracker.ConsumeBdaHintWord(word);
+	struct Claim {
+		MemoryTracker& tracker;
+		size_t         word;
+		uint64_t&      remaining;
+		~Claim() { tracker.RestoreBdaHints(word, remaining); }
+	} claim {m_memory_tracker, word, bits};
+	while (bits != 0) {
+		const auto region = word * 64 + static_cast<size_t>(std::countr_zero(bits));
+		if (!SynchronizeBdaRegion(region, mapped)) {
+			return false;
+		}
+		// Do not touch the shared word again: a concurrent write may have republished it.
+		bits &= bits - 1;
 	}
 	return true;
 }

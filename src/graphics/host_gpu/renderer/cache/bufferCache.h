@@ -112,6 +112,7 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool SynchronizeBdaWord(size_t word, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
 	                                          uint64_t begin, uint64_t end);

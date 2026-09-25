@@ -14,7 +14,8 @@ validated by this patch set.
 - **BDA discovery (PR #562):** CPU-dirty region hints narrow the search for cached buffers requiring
   uploads. The per-page dirty state remains authoritative. Region creation, CPU writes, mapping,
   and buffer registration publish hints; concurrent publications are preserved across consumption.
-  Inconsistent ownership falls back to the legacy walk.
+  Inconsistent ownership falls back to the legacy walk. A 64-word summary (one bit per hint word)
+  lets a pass skip clean hint words, so an idle pass reads 64 words instead of 4,096.
 - **Windows address waits (PR #618):** native `WaitOnAddress` parks stack-allocated waiter records.
   Sharded locks replace the shared allocating registry. Explicit wakes remain visible during signal
   callbacks, and counted wakes are bounded by registered waiters rather than the requested count.
@@ -141,13 +142,16 @@ On September 24, 2026, this workload on the Ryzen 7 7800X3D / RX 9070 XT measure
 
 | Discovery path | Mean CPU microseconds/pass | Median batch-average microseconds/pass |
 | --- | ---: | ---: |
-| Original full scan | 17.551 | 17.370 |
-| Selective hints | 7.068 | 6.986 |
+| Original full scan | 16.443 | 16.315 |
+| Selective hints with summary words | 0.110 | 0.111 |
 
-There were 512 unchanged cached buffers and 2,048 passes per mode. This is approximately 60% less
-CPU time for discovery in that synthetic workload. It does not measure dirty uploads, shader cost,
-GPU execution, frame time, or Astro Bot FPS. The GPU identity logged by the harness was
-`AMD Radeon RX 9070 XT`, Vulkan driver value `8389003`.
+There were 512 unchanged cached buffers and 2,048 passes per mode. Before the summary words, the
+selective pass scanned all 4,096 hint words and measured 7.068 µs (median 6.986 µs) on the same
+workload. That fixed cost made it slower than the full scan below roughly 250 cached buffers
+(0.96 µs versus 6.8 µs at 32 buffers). With the summary words it is faster at every tested size
+(32 to 8,192 buffers). The benchmark does not measure dirty uploads, shader cost, GPU execution,
+frame time, or Astro Bot FPS. The GPU identity logged by the harness was `AMD Radeon RX 9070 XT`,
+Vulkan driver value `8389003`.
 
 ## Remaining rendering work
 

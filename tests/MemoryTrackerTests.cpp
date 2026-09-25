@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -908,6 +909,111 @@ void TestBdaHintRaces() {
   Release(memory);
 }
 
+// Mirrors BufferCache::SynchronizeBdaSelective's claim order: summary word, then hint words.
+std::vector<uint64_t> ClaimSelectivePass(MemoryTracker &tracker) {
+  std::vector<uint64_t> claimed(MemoryTracker::BDA_HINT_WORDS);
+  for (size_t summary = 0; summary < MemoryTracker::BDA_SUMMARY_WORDS;
+       ++summary) {
+    for (auto words = tracker.ConsumeBdaSummaryWord(summary); words != 0;
+         words &= words - 1) {
+      const auto word = summary * 64 + std::countr_zero(words);
+      claimed[word] |= tracker.ConsumeBdaHintWord(word);
+    }
+  }
+  return claimed;
+}
+
+void TestBdaHintSummary() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto word_span = region_size * 64;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+
+  // A range crossing both a hint-word and a summary-word boundary.
+  const uint64_t boundary = word_span * 64;
+  tracker.PublishBdaHints(boundary - 1, 2);
+  Check(tracker.ConsumeBdaSummaryWord(0) == (uint64_t{1} << 63) &&
+            tracker.ConsumeBdaSummaryWord(1) == 1,
+        "cross-summary publication lost one summary bit");
+  Check(tracker.ConsumeBdaHintWord(63) == (uint64_t{1} << 63) &&
+            tracker.ConsumeBdaHintWord(64) == 1,
+        "cross-summary publication lost one hint bit");
+  tracker.PublishBdaHints(TRACKER_ADDRESS_SIZE - 1, 1);
+  Check(tracker.ConsumeBdaSummaryWord(MemoryTracker::BDA_SUMMARY_WORDS - 1) ==
+            (uint64_t{1} << 63),
+        "last-address publication overflowed the summary index");
+  (void)tracker.ConsumeBdaHintWord(MemoryTracker::BDA_HINT_WORDS - 1);
+  Check(ClaimSelectivePass(tracker) ==
+            std::vector<uint64_t>(MemoryTracker::BDA_HINT_WORDS),
+        "consumed hints remained visible to a selective pass");
+
+  constexpr uint64_t address = 0x0000000203000000ull;
+  const auto region = address / region_size;
+  const auto word = region / 64;
+  const auto bit = uint64_t{1} << (region % 64);
+  tracker.PublishBdaHints(address, 1);
+  // A pass that claimed the summary but not yet the hint word: a republished
+  // hint must restore the summary bit so a later pass finds it.
+  (void)tracker.ConsumeBdaSummaryWord(word / 64);
+  Check(!tracker.IsBdaHintPending(region),
+        "claimed summary still reported the region pending");
+  tracker.PublishBdaHints(address, 1);
+  Check(tracker.IsBdaHintPending(region),
+        "republished hint did not restore its claimed summary bit");
+  auto claimed = ClaimSelectivePass(tracker);
+  Check(claimed[word] == bit, "selective pass did not claim the hint");
+
+  // Restoring an unfinished claim also re-publishes its summary bit.
+  tracker.RestoreBdaHints(word, bit);
+  Check(tracker.IsBdaHintPending(region),
+        "restored claim was not reachable from its summary");
+  (void)ClaimSelectivePass(tracker);
+  tracker.RestoreBdaSummary(word / 64, uint64_t{1} << (word % 64));
+  Check(ClaimSelectivePass(tracker)[word] == 0,
+        "restored summary bit reported a hint that was already claimed");
+
+  // No publication may be lost while passes run concurrently.
+  constexpr int publishers = 4;
+  constexpr int publications = 20000;
+  std::atomic<int> finished{0};
+  std::vector<std::vector<uint64_t>> published(
+      publishers, std::vector<uint64_t>(MemoryTracker::BDA_HINT_WORDS));
+  std::vector<uint64_t> total(MemoryTracker::BDA_HINT_WORDS);
+  {
+    std::vector<std::jthread> threads;
+    for (int thread = 0; thread < publishers; ++thread) {
+      threads.emplace_back([&, thread] {
+        uint64_t state = 0x9e3779b97f4a7c15ull * (thread + 1);
+        for (int index = 0; index < publications; ++index) {
+          state = state * 6364136223846793005ull + 1442695040888963407ull;
+          // Concentrate on a few summary words so publishers and the consumer
+          // contend on the same summary and hint words.
+          const auto target = (state >> 20) % (64 * 64 * 3);
+          tracker.PublishBdaHints(target * region_size, 1);
+          published[thread][target / 64] |= uint64_t{1} << (target % 64);
+        }
+        finished.fetch_add(1);
+      });
+    }
+    while (finished.load() != publishers) {
+      const auto pass = ClaimSelectivePass(tracker);
+      for (size_t index = 0; index < total.size(); ++index) {
+        total[index] |= pass[index];
+      }
+    }
+  }
+  const auto last = ClaimSelectivePass(tracker);
+  for (size_t index = 0; index < total.size(); ++index) {
+    total[index] |= last[index];
+    uint64_t expected = 0;
+    for (const auto &thread : published) {
+      expected |= thread[index];
+    }
+    Check((total[index] & expected) == expected,
+          "concurrent selective passes lost a published hint");
+  }
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1069,6 +1175,7 @@ int main(int argc, char **argv) {
   TestFullRegionGpuUnmarkBatching();
   TestBdaHintPublication();
   TestBdaHintRaces();
+  TestBdaHintSummary();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

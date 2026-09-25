@@ -71,12 +71,27 @@ private:
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
+// Sets region hint bits, then the hint word's summary bit. Consumers exchange a summary word
+// before its hint words, so a publisher that sees its summary bit already set (sequentially
+// consistent with that exchange) knows the consumer will still claim these hint bits.
+inline void PublishBdaHintBits(std::atomic<uint64_t>& hint_word, uint64_t bits,
+                               std::atomic<uint64_t>& summary_word,
+                               uint64_t summary_bit) noexcept {
+	hint_word.fetch_or(bits, std::memory_order_seq_cst);
+	// Skip the shared read-modify-write when possible: one summary word covers 16 GiB.
+	if ((summary_word.load(std::memory_order_seq_cst) & summary_bit) == 0) {
+		summary_word.fetch_or(summary_bit, std::memory_order_seq_cst);
+	}
+}
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
-	              std::atomic<uint64_t>& bda_hint_word)
+	              std::atomic<uint64_t>& bda_hint_word, std::atomic<uint64_t>& bda_summary_word)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr), m_bda_hint_word(bda_hint_word),
-	      m_bda_hint_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE) % 64u)) {
+	      m_bda_hint_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE) % 64u)),
+	      m_bda_summary_word(bda_summary_word),
+	      m_bda_summary_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE / 64u) % 64u)) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -89,7 +104,8 @@ public:
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	void                   PublishBdaHint() const noexcept {
-		m_bda_hint_word.fetch_or(m_bda_hint_mask, std::memory_order_release);
+		PublishBdaHintBits(m_bda_hint_word, m_bda_hint_mask, m_bda_summary_word,
+		                   m_bda_summary_mask);
 	}
 	// Caller holds lock. This snapshot is only a discovery hint; uploads read the live bits.
 	[[nodiscard]] const RegionBits& CpuDirtyBits() const noexcept { return m_cpu_dirty; }
@@ -200,6 +216,8 @@ private:
 	RegionBits   m_readable;
 	std::atomic<uint64_t>& m_bda_hint_word;
 	uint64_t               m_bda_hint_mask;
+	std::atomic<uint64_t>& m_bda_summary_word;
+	uint64_t               m_bda_summary_mask;
 };
 
 } // namespace Libs::Graphics

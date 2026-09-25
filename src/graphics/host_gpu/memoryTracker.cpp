@@ -10,6 +10,7 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_bda_hints = std::make_unique<std::atomic<uint64_t>[]>(BDA_HINT_WORDS);
+	m_bda_summary = std::make_unique<std::atomic<uint64_t>[]>(BDA_SUMMARY_WORDS);
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -61,7 +62,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 		return manager;
 	}
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE,
-	                                                m_bda_hints[index / 64]);
+	                                                m_bda_hints[index / 64],
+	                                                m_bda_summary[index / 64 / 64]);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	// New managers start entirely dirty. Publish the hint before the pointer; a consumer
@@ -78,29 +80,56 @@ void MemoryTracker::PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept {
 	const auto end = vaddr + std::min(size, TRACKER_ADDRESS_SIZE - vaddr);
 	for (auto region = vaddr / TRACKER_REGION_SIZE; region <= (end - 1) / TRACKER_REGION_SIZE;
 	     ++region) {
-		m_bda_hints[region / 64].fetch_or(uint64_t {1} << (region % 64), std::memory_order_release);
+		const auto word = region / 64;
+		PublishBdaHintBits(m_bda_hints[word], uint64_t {1} << (region % 64), m_bda_summary[word / 64],
+		                   uint64_t {1} << (word % 64));
+	}
+}
+
+uint64_t MemoryTracker::ConsumeBdaSummaryWord(size_t summary) noexcept {
+	EXIT_IF(summary >= BDA_SUMMARY_WORDS);
+	auto& words = m_bda_summary[summary];
+	if (words.load(std::memory_order_seq_cst) == 0) {
+		return 0;
+	}
+	return words.exchange(0, std::memory_order_seq_cst);
+}
+
+void MemoryTracker::RestoreBdaSummary(size_t summary, uint64_t words) noexcept {
+	EXIT_IF(summary >= BDA_SUMMARY_WORDS);
+	if (words != 0) {
+		m_bda_summary[summary].fetch_or(words, std::memory_order_seq_cst);
 	}
 }
 
 uint64_t MemoryTracker::ConsumeBdaHintWord(size_t word) noexcept {
 	EXIT_IF(word >= BDA_HINT_WORDS);
 	auto& hint = m_bda_hints[word];
-	if (hint.load(std::memory_order_relaxed) == 0) {
+	// Sequentially consistent with PublishBdaHintBits: after this pass claimed the summary bit,
+	// a publisher that skipped its summary store must have its hint bits observed here.
+	if (hint.load(std::memory_order_seq_cst) == 0) {
 		return 0;
 	}
-	return hint.exchange(0, std::memory_order_acquire);
+	return hint.exchange(0, std::memory_order_seq_cst);
 }
 
 void MemoryTracker::RestoreBdaHints(size_t word, uint64_t bits) noexcept {
 	EXIT_IF(word >= BDA_HINT_WORDS);
 	if (bits != 0) {
-		m_bda_hints[word].fetch_or(bits, std::memory_order_release);
+		PublishBdaHintBits(m_bda_hints[word], bits, m_bda_summary[word / 64],
+		                   uint64_t {1} << (word % 64));
 	}
 }
 
 bool MemoryTracker::IsBdaHintPending(uint64_t region) const noexcept {
-	return region < REGION_COUNT && (m_bda_hints[region / 64].load(std::memory_order_acquire) &
-	                                 (uint64_t {1} << (region % 64))) != 0;
+	if (region >= REGION_COUNT) {
+		return false;
+	}
+	const auto word = region / 64;
+	return (m_bda_hints[word].load(std::memory_order_acquire) & (uint64_t {1} << (region % 64))) !=
+	           0 &&
+	       (m_bda_summary[word / 64].load(std::memory_order_acquire) &
+	        (uint64_t {1} << (word % 64))) != 0;
 }
 
 RegionBits MemoryTracker::SnapshotCpuDirty(RegionManager& manager) {
