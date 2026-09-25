@@ -159,6 +159,7 @@ window-title frame rate after a 20 s settle, with the scene checked at the start
 | + queue thread for submits | 39.1 / 39.2 | 62% |
 | + shader hash cached per registration | 40.4 / 40.3 | 62% |
 | + clean reads on protected pages (A/B 39.8 -> 42.2) | 42.2 (mean of runs) | - |
+| + GPU-built mesh indirect draws (same binary, flag off -> on) | 42.2 -> 51.4 | - |
 
 Eager readback removed the 21 ms per frame of guest waits and cut readback traffic from about
 23 MiB to under 1 MiB per 5 s. The frame rate did not move, because Thread_Gpu, not the guest
@@ -174,13 +175,22 @@ flight. Thread_Gpu's own table reads peek at the page's GPU-dirty bit without a 
 dirty page they read clean bytes from the backing instead of faulting. In alternating A/B runs
 (two 45 s rounds each), this took the overworld from 39.8 to 42.2 fps.
 
-Thread_Gpu still stalls on one read fault per frame:
-- **About 4.7 ms:** a mesh-emulated indirect draw reading arguments that a compute dispatch
-  wrote earlier in the frame. All of Astro Bot's indirect draws with GPU-written arguments are
-  mesh-emulated, so a plain `vkCmdDrawIndexedIndirect` path would not remove this drain.
-  Downloading the arguments eagerly and submitting right away only turned the drain into an
-  equally long tick wait: when Thread_Gpu reaches the draw, the GPU has not yet run the
-  dispatch. Removing it needs mesh dispatches driven by the GPU-written arguments.
+**GPU-built mesh indirect draws:** the last Thread_Gpu stall, about 4.7 ms per frame, was a
+mesh-emulated `DRAW_INDEX_INDIRECT` reading arguments that a compute dispatch wrote earlier in
+the frame. All of Astro Bot's indirect draws with GPU-written arguments are mesh-emulated, so a
+plain `vkCmdDrawIndexedIndirect` path would not help. Downloading the arguments eagerly and
+submitting right away only turned the drain into an equally long tick wait, because when
+Thread_Gpu reaches the draw, the GPU has not yet run the dispatch.
+
+Mesh shaders now load their seven draw dwords from a parameter record, through a device address
+in push-constant dwords 0 and 1. Direct draws write one record per slice. For a GPU-args draw,
+a one-thread compute pass (`mesh_indirect_args.comp`) writes the record and a
+`VkDrawMeshTasksIndirectCommandEXT` from the arguments, and `vkCmdDrawMeshTasksIndirectEXT`
+draws. It applies the CPU path's index-count clamp and the host workgroup limits, and the draw
+registers the whole index buffer for the shader's index reads. With the same binary, the
+overworld runs at 42.2 fps with `--gpu-mesh-indirect false` and 51.4 fps with it on (alternating
+A/B, two 45 s rounds each: 41.3 / 51.2 and 43.1 / 51.6).
+Full-resolution screenshots of both match, and drain stats show no full drains on Thread_Gpu.
 
 Reviewed but not ported: #506 (its texture-residency change would raise memory to the pressure
 threshold, where eviction drains the GPU; read-only compute barriers almost never apply; block
@@ -192,6 +202,8 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 ```text
 --async-submit true           Default: submit the GPU thread's work from a queue thread.
 --async-submit false          Submit on the GPU thread (the previous behavior).
+--gpu-mesh-indirect true      Default: build mesh-emulated GPU-args indirect draws on the GPU.
+--gpu-mesh-indirect false     Read the arguments on the CPU (the previous behavior).
 --bda-sync Selective          Default: use dirty-region discovery, with conservative fallback.
 --bda-sync Legacy             Use the full mapped-buffer walk for controlled comparisons.
 --bda-sync SelectiveChecked   Use selective discovery and check remaining dirty-page coverage.
