@@ -1,6 +1,7 @@
 # Performance roadmap (draft)
 
-Status on September 25, 2026: research notes. No emulator behavior was changed by this work.
+Status on September 25, 2026: research notes. Items implemented since are listed under "Done
+since".
 Full agent notes are in [raw-findings.md](raw-findings.md). A snapshot of upstream's open pull
 requests (fetched as `refs/pull/<N>/head`) is in [upstream-open-prs.txt](upstream-open-prs.txt).
 
@@ -31,6 +32,15 @@ Per frame in Astro Bot, before the DCC fix:
 Every DCC check found a real clear. The DCC drains are now gone (GPU conditional clears, see
 performance-amd.md). On the overworld the guest-thread read fault is the largest remaining
 drain, at about 9.5 ms per frame.
+
+### Done since (September 25, overworld, pixel-verified runs)
+
+Items 1 and 3 below are implemented, along with idle-only label submits and eager readback of
+hot pages. The overworld went from 25.7 to 39.1 fps; performance-amd.md has the table.
+Thread_Gpu is now the saturated thread, at about 72% of a core plus its remaining read-fault
+waits. The next costs on it are per-draw resource materialization (the SRT work on
+`perf/srt-materialization`), per-draw shader hashing, and the mesh-emulated indirect-args
+drain.
 
 ## Can we have multi-core support?
 

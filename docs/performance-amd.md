@@ -117,8 +117,64 @@ through both paths and requires identical results.
 The planet in the overworld shows blotchy dark patches and the background a fine dot pattern.
 Upstream `main` (5a705dd) renders the same artifacts, so they predate this branch.
 
-The largest remaining source is one guest-thread read fault per frame (about 9.5 ms on the
-overworld), followed by the GPU thread reading GPU-written indirect draw arguments.
+**Asynchronous readback:** a guest thread that faults on GPU-written buffer memory no longer
+drains the GPU thread. Thread_Gpu records the download and submits it. The faulting thread then
+waits on that download's own timeline tick and publication, while Thread_Gpu keeps processing
+PM4. The memory tracker arms the downloaded pages with a token and a tick, and publication
+clears only pages still armed with its token. A GPU write recorded in between disarms a page, so
+it stays protected until a newer download publishes it.
+
+**Label submits:** a RELEASE_MEM that writes a plain label (no interrupt) submitted the command
+buffer every time, hundreds of times a frame in Astro Bot. The label value is written to guest
+memory when the packet is parsed, so the submit only kept the GPU fed. It now submits only when
+the GPU has retired all earlier work. Labels with an interrupt still submit right away.
+
+**Eager readback:** Astro Bot's "Draw Shadow" thread reads 8 bytes, 3-4 times a frame, that a
+compute dispatch wrote about 0.75 frames earlier. Each read faulted, and its download queued
+behind all the GPU work submitted since: about 6 ms per read, 21 ms per frame. Pages that
+guest-thread reads fault on are now "hot" (at most 64). A recorded write to a hot page is
+downloaded at the next command-processor flush point, and the next read usually finds it
+already published.
+
+**Queue thread:** `vkQueueSubmit` took about 13 ms of each frame on Thread_Gpu, the saturated
+thread: about 330 submits at 18 us each, plus waits for the queue lock held by present. The
+render scheduler now allocates the tick and hands the command buffer to a dedicated thread,
+which submits in tick order. `--async-submit false` restores inline submission.
+
+**Shader hash cache:** 305 of the 308 recorded Astro Bot shaders declare no hash, so
+`GetShaderParams` hashed their whole code (about 4.4 KB) on every draw. The shader map entry now
+caches the hash, and `AgcCreateShader` registering the address again drops it.
+
+Overworld measurements use the ship save: title screen, cross, then cross on "SAVE DATA 1". The
+ship hovers at its spawn above the first planet with no further input. The title screen renders
+far faster and is not a valid benchmark scene. Each run is 60 one-second samples of the
+window-title frame rate after a 20 s settle, with the scene checked at the start and end.
+
+| Build | Overworld fps (mean / median) | GPU 3D busy |
+|---|---|---|
+| 84295af (GPU DCC clears) | 25.7 / 25.7 | 58% |
+| + asynchronous readback | 30.6 / 30.5 | 59% |
+| + idle-only label submits | 34.6 / 34.8 | 61% |
+| + eager readback of hot pages | 34.4 / 34.4 | 61% |
+| + queue thread for submits | 39.1 / 39.2 | 62% |
+| + shader hash cached per registration | 40.4 / 40.3 | 62% |
+
+Eager readback removed the 21 ms per frame of guest waits and cut readback traffic from about
+23 MiB to under 1 MiB per 5 s. The frame rate did not move, because Thread_Gpu, not the guest
+thread, bounded the frame.
+
+With the queue thread, Thread_Gpu still stalls on two read faults per frame:
+- **About 3.8 ms:** hashing shader code in `GetShaderParams`. One shader is registered again
+  every frame, so it is rehashed every frame, and its code bytes are marked GPU-written.
+  Reading them from the backing when clean did not avoid the fault. The likely cause is a
+  writable buffer binding whose range covers the code, and the write history rotates too fast
+  to name it.
+- **About 2.8 ms:** a mesh-emulated indirect draw reading arguments that a compute dispatch
+  wrote earlier in the frame. All of Astro Bot's indirect draws with GPU-written arguments are
+  mesh-emulated, so a plain `vkCmdDrawIndexedIndirect` path would not remove this drain.
+  Downloading the arguments eagerly and submitting right away only turned the drain into an
+  equally long tick wait: when Thread_Gpu reaches the draw, the GPU has not yet run the
+  dispatch. Removing it needs mesh dispatches driven by the GPU-written arguments.
 
 Reviewed but not ported: #506 (its texture-residency change would raise memory to the pressure
 threshold, where eviction drains the GPU; read-only compute barriers almost never apply; block
@@ -128,6 +184,8 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 ## Runtime comparison controls
 
 ```text
+--async-submit true           Default: submit the GPU thread's work from a queue thread.
+--async-submit false          Submit on the GPU thread (the previous behavior).
 --bda-sync Selective          Default: use dirty-region discovery, with conservative fallback.
 --bda-sync Legacy             Use the full mapped-buffer walk for controlled comparisons.
 --bda-sync SelectiveChecked   Use selective discovery and check remaining dirty-page coverage.
