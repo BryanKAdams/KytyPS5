@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -176,18 +177,22 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
-	const auto tick = Submit();
+	DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
+	const auto            tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
 	CheckActive();
-	if (!m_command.IsInvalid()) {
-		Submit();
+	{
+		DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
+		if (!m_command.IsInvalid()) {
+			Submit();
+		}
+		m_master.Wait(CurrentTick() - 1);
+		BeginNext();
 	}
-	m_master.Wait(CurrentTick() - 1);
-	BeginNext();
 	PopPendingOperations();
 }
 
@@ -195,6 +200,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
+		DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
@@ -202,6 +208,9 @@ void CommandScheduler::Wait(uint64_t tick) {
 		EXIT_IF(submitted_tick != tick);
 		m_master.Wait(tick);
 		BeginNext();
+	} else if (DrainStats::Enabled() && !IsFree(tick)) {
+		DrainStats::WaitTimer timer(DrainStats::Kind::TickWait);
+		m_master.Wait(tick);
 	} else {
 		m_master.Wait(tick);
 	}
@@ -304,12 +313,17 @@ void CommandScheduler::DrainPriorityOperations() {
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
+	const auto       done = [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
-	});
+	};
+	if (done()) {
+		return;
+	}
+	DrainStats::WaitTimer timer(DrainStats::Kind::PriorityWait);
+	m_operation_available.wait(lock, done);
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {

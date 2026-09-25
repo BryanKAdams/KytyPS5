@@ -82,6 +82,7 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --drain-stats <seconds>              Report GPU waits by cause every N seconds.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -344,6 +345,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--drain-stats") {
+			uint32_t interval = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), interval);
+			if (error != std::errc {} || end != value.data() + value.size() || interval > 3600) {
+				::printf("invalid drain-stats interval: %s\n", value.c_str());
+				return false;
+			}
+			options.config.drain_stats_interval = interval;
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -137,6 +138,8 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		// Commands run between packets on behalf of other threads.
+		DrainStats::Pm4OpScope op(DrainStats::NoPm4Op);
 		command();
 	}
 }
@@ -504,6 +507,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					DrainStats::WaitTimer poll(DrainStats::Kind::BlockedPoll);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -677,6 +681,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	DrainStats::SetPm4Op(DrainStats::NoPm4Op);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -754,6 +759,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		DrainStats::SetPm4Op(DrainStats::Pm4Op(opcode, KYTY_PM4_R(packet_header)));
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -821,6 +827,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 }
 
 void CommandProcessor::SynchronizePredicate(uint64_t address, uint64_t size) {
+	DrainStats::ReasonScope reason(DrainStats::Reason::Predicate);
 	if (!GuestRange {address, size}.Valid()) {
 		// Host-only command buffers are also used by the PM4 test harness. Unknown ownership
 		// cannot justify removing the legacy synchronization.
@@ -1567,6 +1574,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	DrainStats::ReasonScope reason(DrainStats::Reason::GdsReadback);
 	GetScheduler().Finish();
 }
 

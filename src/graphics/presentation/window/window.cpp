@@ -13,6 +13,7 @@
 #include "common/timer.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -905,6 +906,7 @@ void WindowContext::UpdateIcon() {
 }
 
 void WindowContext::UpdateTitle(bool new_frame) {
+	DrainStats::CountFrame(new_frame);
 	if (!frame_statistics.Record(Common::Timer::QueryPerformanceCounter(),
 	                             Common::Timer::QueryPerformanceFrequency(), new_frame)) {
 		return;

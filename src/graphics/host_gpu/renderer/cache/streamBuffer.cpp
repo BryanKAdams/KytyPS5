@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 
 #include <cstring>
 #include <numeric>
@@ -317,6 +318,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}
+	using DrainStats::Reason;
+	DrainStats::ReasonScope reason(Usage() == MemoryUsage::Upload     ? Reason::UploadRingWrap
+	                               : Usage() == MemoryUsage::Download ? Reason::DownloadRingWrap
+	                                                                  : Reason::StreamRingWrap);
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {

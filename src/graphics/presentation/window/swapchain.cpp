@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -154,7 +155,10 @@ public:
 	}
 
 private:
-	void WaitForFrame(Presenter::Frame& frame) { m_scheduler.Wait(frame.present_tick); }
+	void WaitForFrame(Presenter::Frame& frame) {
+		DrainStats::ReasonScope reason(DrainStats::Reason::PresentFrame);
+		m_scheduler.Wait(frame.present_tick);
+	}
 
 	WindowContext&                                 m_window;
 	CommandScheduler&                              m_scheduler;

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -365,7 +366,8 @@ void TextureCache::FreeImage(ImageId id, std::vector<ImageId>* retired) {
 			};
 			// All callers own m_lock. Release it while waiting, including for a priority
 			// callback that needs the cache; restore it before touching the owner again.
-			const ReacquireLock unlocked(m_lock);
+			const ReacquireLock     unlocked(m_lock);
+			DrainStats::ReasonScope reason(DrainStats::Reason::FreeImage);
 			m_scheduler.Wait(completion_tick);
 			m_scheduler.WaitPriorityOperations(completion_tick);
 		}
@@ -1210,6 +1212,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		DrainStats::ReasonScope reason(DrainStats::Reason::DccClear);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
@@ -1730,6 +1733,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		// thread while holding the texture lock on a CPU fault path.
 		lock.unlock();
 		m_scheduler.Context().GetGpu().SendCommandSync([this, page_begin, page_size] {
+			DrainStats::ReasonScope reason(DrainStats::Reason::TexturePendingDownload);
 			if (HasPendingDownload(page_begin, page_size)) {
 				const auto tick = m_scheduler.CurrentTick();
 				m_scheduler.Wait(tick);
@@ -2194,7 +2198,8 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 		// priority writeback completes. Those callbacks use only the separate pending mutex.
 		// General callbacks can replace buffers after PrepareBda while a draw is being assembled;
 		// leave them for the GPU operation boundary and release only this collector's victims.
-		const auto completion_tick = m_scheduler.CurrentTick();
+		DrainStats::ReasonScope reason(DrainStats::Reason::TextureGc);
+		const auto              completion_tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(completion_tick);
 		m_scheduler.WaitPriorityOperations(completion_tick);
 		std::vector<ImageId> retired;

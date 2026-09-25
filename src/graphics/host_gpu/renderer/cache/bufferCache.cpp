@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -129,6 +130,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	DrainStats::Record(DrainStats::Kind::Readback, total_size);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -250,7 +252,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const auto reason = DrainStats::CurrentReason();
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason] {
+		DrainStats::ReasonScope reason_scope(reason);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -268,6 +272,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		} else {
+			DrainStats::Record(DrainStats::Kind::ReadbackClean, 0);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -600,6 +606,7 @@ void BufferCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	DrainStats::ReasonScope reason(DrainStats::Reason::BufferGc);
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);

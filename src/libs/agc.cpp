@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -57,6 +58,8 @@ void Initialize() {
 		RenderDocInit();
 	}
 
+	DrainStats::Start(Config::GetDrainStatsInterval());
+
 	auto width  = Config::GetScreenWidth();
 	auto height = Config::GetScreenHeight();
 
@@ -69,6 +72,7 @@ void Initialize() {
 
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
+	DrainStats::Stop();
 	g_renderer->ShutdownGpu();
 	VideoOut::VideoOutShutdown();
 	WindowShutdown();

@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -62,10 +63,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const bool gpu_thread = GuestGpu::IsGpuThread();
 	if (access == PageFaultAccess::Write) {
+		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
+		                                          : DrainStats::Reason::GuestWriteFault);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadReadFault
+		                                          : DrainStats::Reason::GuestReadFault);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -75,6 +81,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	DrainStats::ReasonScope reason(DrainStats::Reason::KernelInvalidate);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
@@ -112,6 +119,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		DrainStats::ReasonScope reason(DrainStats::Reason::Unmap);
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
