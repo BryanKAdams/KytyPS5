@@ -124,7 +124,7 @@ private:
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);

@@ -16457,6 +16457,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_GT_F32:
   case Opcode::V_CMPX_LG_F32:
   case Opcode::V_CMPX_GE_F32:
+  case Opcode::V_CMPX_O_F32:
   case Opcode::V_CMPX_NGE_F32:
   case Opcode::V_CMPX_NLG_F32:
   case Opcode::V_CMPX_NGT_F32:
@@ -22342,6 +22343,69 @@ TestCase VectorCompareExecOps() {
            O::V_CMPX_EQ_U32,  O::V_CMPX_LE_U32,  O::V_CMPX_GT_U32,
            O::V_CMPX_NE_U32,  O::V_CMPX_GE_U32,  O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase VectorVopcCmpxOrderedCapturedExecMask() {
+  using O = ShaderOpcode;
+  struct CompareCase {
+    u32 lhs;
+    u32 rhs;
+    u32 initial_exec;
+    u32 expected_exec;
+    bool captured;
+  };
+  constexpr std::array<CompareCase, 8> cases{{
+      {0x3f800000u, 0x3f800000u, 1u, 1u, true}, // Finite value.
+      {0x7fc00000u, 0x7fc00000u, 1u, 0u, true}, // Quiet NaN.
+      {0x7f800001u, 0x7f800001u, 1u, 0u, true}, // Signaling NaN.
+      {0x7f800000u, 0x7f800000u, 1u, 1u, true}, // Infinity is ordered.
+      {0x80000000u, 0x80000000u, 1u, 1u, true}, // Signed zero is ordered.
+      {0x3f800000u, 0x3f800000u, 0u, 0u, true}, // Inactive lane.
+      {0x3f800000u, 0x7fc00000u, 1u, 0u, false}, // NaN in SRC1.
+      {0x7fc00000u, 0x3f800000u, 1u, 0u, false}, // NaN in SRC0.
+  }};
+  constexpr u32 vcc_lo = 0x13579bdfu;
+  constexpr u32 vcc_hi = 0x2468ace0u;
+
+  TestCase test;
+  test.name = "VectorVopcCmpxOrderedCapturedExecMask";
+  auto &code = test.code;
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.lhs);
+    test.initial.push_back(entry.rhs);
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 1, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 2, 30);
+    AppendSMovLiteral(&code, 106, vcc_lo);
+    AppendSMovLiteral(&code, 107, vcc_hi);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.initial_exec)));
+    code.push_back(entry.captured ? 0x7c2e0301u
+                                  : EncodeVopc(0x17u, Vgpr(1), 2));
+    code.push_back(EncodeSMovB32(20, 126));
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(22, 106));
+    code.push_back(EncodeSMovB32(23, 107));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = static_cast<u32>(cases.size()) * 2u + i * 4u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgprPair(&code, 22, out + 2u);
+    test.expected.insert(test.expected.end(),
+                         {entry.expected_exec, 0u, vcc_lo, vcc_hi});
+  }
+  test.initial.resize(test.expected.size());
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_O_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMPX_O_F32 exec_lo, v1, v1", 6u},
+                         {"V_CMPX_O_F32 exec_lo, v1, v2", 2u}};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase VectorVop3FloatCompareNegSourceModifier() {
@@ -28651,6 +28715,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
   AddCase(Vop3CndmaskAllowsDataSourceModifier);
   AddCase(VectorCompareExecOps);
+  AddCase(VectorVopcCmpxOrderedCapturedExecMask);
   AddCase(VectorVop3FloatCompareNegSourceModifier);
   AddCase(VectorVop3CmpxWritesExecMask);
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
@@ -33422,6 +33487,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDppRowXmask());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpxOrderedCapturedExecMask());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-snorm-store-only") == 0) {
