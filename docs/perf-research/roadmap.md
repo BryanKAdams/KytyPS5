@@ -1,6 +1,6 @@
 # Performance roadmap (draft)
 
-Status on September 25, 2026: research notes only. No emulator behavior was changed by this work.
+Status on September 25, 2026: research notes. No emulator behavior was changed by this work.
 Full agent notes are in [raw-findings.md](raw-findings.md). A snapshot of upstream's open pull
 requests (fetched as `refs/pull/<N>/head`) is in [upstream-open-prs.txt](upstream-open-prs.txt).
 
@@ -10,7 +10,10 @@ Astro Bot on a Ryzen 7 7800X3D and RX 9070 XT ran at about 27 fps with the GPU a
 The guest GPU thread (`Thread_Gpu`, `GuestGpu::ThreadRun`) was the bottleneck:
 
 - At least 38% of its time was spent in full GPU drains for CPU readbacks.
-- About 12% went to shader translation.
+- About 12% went to the SRT walker (`SrtWalker::EvaluateWide`, `Value::Resolve`). This was first
+  read as shader translation, but the run compiled no shaders after the startup replay. It is the
+  per-draw `MaterializeResources` call on every shader cache hit (see the second pass in the raw
+  notes).
 
 The CPU and GPU take turns instead of overlapping.
 
@@ -66,6 +69,9 @@ Ways to move work off that thread, cheapest first:
 
 - **Asynchronous fault readback** with per-page arm tokens, finalized in the priority callback
   (item 1 above). This is the biggest expected win for the 38%.
+- **Cheaper per-draw resource materialization** (the 12%): memoize the snapshot per source entry
+  when the plan is a pure function of user data and flat SRT slots, or compile the plan into a
+  flat evaluation program. Also avoid the texture-cache lock on clean SRT reads.
 - **DCC fast-clear materialization without readback.** Remember known fill values;
   `MaterializeDccClear` currently drains whenever the metadata range is GPU-dirty.
 - **Queue-owner submit thread.**
@@ -94,17 +100,17 @@ On Mesa 25.2 lavapipe, 43 of 47 targets pass. `shader_recompiler_compute`,
 `compute_meta_clear_classification`, `shader_precompile_gpu` and `kernel_file_system` need
 features, formats, a clean build, or a video device that lavapipe in a container does not provide.
 
-## Not finished
+## Research status
 
-The runs that would have mapped these areas were stopped:
+All thirteen areas are now covered. The last eight (texture-cache lookups, DMA, fault handling,
+command-processor waits, per-draw CPU cost, host sync, frame pacing, and upstream PR triage) are in
+the "Second pass" section of the raw notes. Main results of that pass:
 
-- texture-cache lookups;
-- the DMA path;
-- fault handling;
-- command-processor waits;
-- per-draw CPU cost;
-- host sync;
-- frame pacing;
-- upstream PR performance triage.
-
-Restarting them is the first step for the next session.
+- **DMA drains:** `DmaData` has no wait of its own. The drains the profile attributed to it can
+  only come from staging-ring wraps (uploads or BDA page-table writes) or from faults in its CPU
+  fast paths.
+- **Texture lookups:** `FindImage` → `MaterializeDccClear` is a real full-drain path for DCC
+  targets whose metadata is GPU-dirty.
+- **Frame pacing:** vblank and present share one thread with a 1 ms `Flip(0)` sleep and take
+  `RenderContext::m_mutex`, so drains inside draws delay presents.
+- **Upstream PRs:** none of the open PRs addresses the Thread_Gpu bottleneck.

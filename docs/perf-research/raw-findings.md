@@ -2,9 +2,9 @@
 
 Automated code-reading agents produced these notes. Four of thirteen areas finished before the session
 was stopped: command scheduling, buffer readback, shader/pipeline creation, and threading. The texture
-cache, DMA, fault handling, command-processor waits, test infrastructure, per-draw CPU cost, host sync,
-frame pacing, and upstream-PR triage areas did not finish. Treat every claim as a lead to verify against
-the code; file:line references are for revision 791ac3a.
+cache, DMA, fault handling, command-processor waits, per-draw CPU cost, host sync, frame pacing, and
+upstream-PR triage areas were covered in a second pass, appended at the end of this file. Treat every
+claim as a lead to verify against the code; file:line references are for revision 791ac3a.
 
 ## Command scheduling and completion tracking (GPU-drain map)
 
@@ -922,3 +922,234 @@ The expensive per-draw work (shader lookup, caches, descriptors) would land in t
 - Default logging is Silent (emulatorConfig.h:66), so LOGF and PRINT_NAME cost about one branch. In File mode, spdlog's _mt sink serializes all threads on its internal mutex (log.cpp:43-50).
 - No open upstream PR addresses the threading architecture. #506 batches RELEASE_MEM flushes (an indication that per-label vkQueueSubmit cost matters). #35 proposes an async pipeline builder but is low quality: it adds test_shader.spv and duplicate headers.
 
+
+
+## Second pass (September 25, 2026): the areas that did not finish
+
+These notes were written by reading the code at revision 964ebc6, whose `src/` is identical to
+791ac3a, and by checking them against the Thread_Gpu stack sample from the September 24 Astro Bot
+run. As above, file:line references are leads to verify, not guarantees.
+
+### Correction: the "12% shader translation" is per-draw resource materialization
+
+The two leaf functions behind the 12% are `SrtWalker::EvaluateWide` (8.1%) and `Value::Resolve`
+(3.5%). They are not compile-time work. The profiled run replayed the shader journal at startup
+("replayed 307 permutations; skipped 0") and compiled nothing afterwards: `ProgramCache::Get`
+prints an unconditional `Shaders: VS … | PS …` line for every new permutation
+(pipelineCache.cpp:379-391), and the run's stdout has none. The hot caller is therefore the cache
+hit path, where `ProgramCache::Get` calls `MaterializeResources` on every draw and dispatch for
+every stage (pipelineCache.cpp:297-300).
+
+`MaterializeResources` (ResourceMaterialization.cpp:932-1058) builds two `SrtWalker`s, a clean one
+and a normal one. It runs `FindActiveSources`, re-evaluates every flat SRT slot
+(`RefreshFlatBuffer`, SrtWalker.cpp:1041-1058), and then walks every buffer, image and sampler
+descriptor dword through the IR. The walker is a recursive IR interpreter. Every argument goes
+through `Value::Resolve()` (an identity-chain walk, Value.cpp:68-70), a dense-memo generation
+check (SrtWalker.cpp:515-527) and an opcode switch (SrtWalker.cpp:648-987). `ReadFirstLane`
+builds two nested walkers per evaluation (SrtWalker.cpp:668-674). Clean reads go through
+`ReadShaderGuestMemory` → `TryReadGpuCleanBacking` (memory.cpp:881-890). Each such read does a
+`std::map` range lookup (`HasGpuDirtyBytes`) plus `TextureCache::IsRegionGpuModified`, which
+takes the texture-cache spin lock and walks the image page table (textureCache.cpp:1995-2007).
+The results are then compared field by field against every permutation in a linear search
+(pipelineCache.cpp:301-309).
+
+Ideas, in order of expected payoff:
+- **Memoize materialization per source entry.** Keep the last user-data span and the last flat
+  SRT buffer for each `SourceEntry`. When a plan has no dynamic reads (`dynamic_reads` empty) and
+  no clean-slot or indirect-image dependencies, the snapshot and specialization are a pure
+  function of the user data, the shader base and the flat slot values. After `RefreshFlatBuffer`,
+  a memcmp against the previous inputs can skip every descriptor evaluation and the permutation
+  search. Risk: an undeclared memory dependency returns a stale descriptor. Such plans must be
+  excluded conservatively, and a debug mode should re-evaluate and compare.
+- **Compile the plan to a flat evaluation program** at `ExtractResourcePlan` time: topologically
+  ordered, identities pre-resolved, operands as slot indices. That removes the recursion,
+  `Resolve()` chains and memo checks. Estimated 3-10x on the walker's own cost.
+- **Skip the texture-cache lock for clean reads** by keeping a GPU-dirty summary that can be read
+  without the lock, or by reading the tracker's GPU bits first.
+- **Put the last-hit permutation at the front** of `SourceEntry::permutations`, as the first
+  survey already proposed.
+
+Measure with inline-aware symbolization (see "Profiling notes" below) before choosing.
+
+### Texture-cache lookups
+
+Per draw: `PrepareDrawRenderState` (renderDraw.cpp:898-935) resolves every MRT slot and the depth
+target through `FindImage` (textureCache.cpp:1305-1401). Descriptor preparation resolves every
+sampled and storage image the same way. Each lookup:
+- takes `m_lock` (a pure spin lock) and runs `FindImagesInRegion`, which visits 1 MiB image-page
+  buckets (textureCache.h:97) and deduplicates by query epoch, then `SameBacking` for each
+  candidate;
+- on a miss, runs `ResolveOverlap` over the candidates, possibly with `FreeImage`,
+  `ExpandImage` or copies;
+- under VRAM pressure, may run `CollectGarbage(true)` at most once per GC tick
+  (textureCache.cpp:1358-1368);
+- always calls `MaterializeDccClear` (textureCache.cpp:1387) after the lock is released. For native
+  DCC surfaces whose metadata range is GPU-dirty, that is a synchronous `ReadMemory` full drain
+  (textureCache.cpp:1210-1214). The September 24 sample showed exactly this chain:
+  `ResolveRenderColorTarget` → `FindImage` → `BufferCache::ReadMemory` → `CommandScheduler::Wait`.
+  When `MaterializeDccClear` consumes a clear, it writes the metadata with `FillBuffer(UINT32_MAX)`
+  on the CPU (textureCache.cpp:1242). If that range is GPU-dirty again, the fill goes through the
+  GPU path (bufferCache.cpp:524-533) and re-arms the drain for the next lookup.
+- `FindTexture` re-runs `RefreshImage` (textureCache.cpp:1463). For images marked "maybe CPU
+  dirty", this hashes guest edges (`HashGuestEdges`, textureCache.cpp:1255-1262) on every
+  binding.
+
+Open questions for the instrumentation: how many `FindImage` calls per frame, how many hit the
+DCC drain, and how many run `HashGuestEdges`.
+
+### DMA path
+
+`CommandProcessor::DmaData` (graphicsRun.cpp:397-450) has no wait of its own. Its drains can only
+come from these inner calls:
+1. **CPU fast paths.** `CopyBuffer` memcpys when neither range is GPU-dirty and no image starts at
+   the source (bufferCache.cpp:549-554). `FillBuffer` does `std::fill` when the destination is
+   not GPU-dirty (bufferCache.cpp:524-528). A write to a clean, write-watched page faults on
+   Thread_Gpu. `HandleFault` then marks the page CPU-dirty without a drain
+   (memoryTracker.h:62-77), and `TextureCache::InvalidateMemory` drains only if an image
+   writeback is pending on that page (textureCache.cpp:1728-1742).
+2. **GPU paths.** `ObtainBuffer` → `SynchronizeBuffer` → `UploadCopies` → `m_staging_buffer.Map`
+   (bufferCache.cpp:427). A 512 MiB staging-ring wrap waits for the previous lap's ticks
+   (streamBuffer.cpp:313-333). That is a full drain only when the lap happened inside the open
+   command buffer.
+3. **Buffer creation.** `FindBuffer` → `CreateBuffer` → `Register` → `WriteDataBuffer`
+   (bufferCache.cpp:79-80) copies BDA page-table entries through the same staging ring.
+4. **Texel sources.** `ObtainBuffer(src, …, is_texel_buffer=true)` → `SynchronizeBufferFromImage`
+   (textureCache.cpp:1837-1901) records an image download into the buffer. That records work but
+   does not wait.
+
+The September 24 stack attributed about 13% of Thread_Gpu samples to `DmaData` → `Wait`, with two
+mislabeled frames between them. Only (2) or (3), a staging-ring wait, fits a direct call chain
+with no exception frames. An exception-driven drain would show `KiUserExceptionDispatcher` and
+`HostException::ExceptionFilter` frames, as the third stack did. Staging usage between two
+submits is the thing to count.
+
+### Fault handling
+
+Path: Windows VEH `ExceptionFilter` (hostException.cpp:85-140) → `KytyExceptionHandler`
+(runtimeLinker.cpp:782-803) → `HandleGpuFault` (memory.cpp:929-931) → `RenderContext::HandleFault`
+(renderContext.cpp:58-72). The handler costs, in order:
+- a kernel exception dispatch of roughly 2-5 µs, unavoidable with page protection;
+- a `shared_mutex` read lock for `IsMapped`;
+- the tracker region `TrackingSpinLock`;
+- for writes, `TextureCache::m_lock`;
+- the page-protection syscall (VirtualProtect) under the PageManager region spin lock
+  (pageManager.cpp:200-249).
+
+Reads of GPU-dirty pages always go to Thread_Gpu (`SendCommandSync`, graphicsRun.cpp:144-156),
+which serves them only between PM4 packets or when idle. While it is inside a drain, other
+faulting threads queue behind it. Only reads of GPU-dirty pages drain; writes to clean tracked
+pages are resolved on the faulting thread.
+
+The fault is reported for one byte, so the 512 KiB window in `ReadMemory` (bufferCache.cpp:259-264)
+is what amortizes consecutive reads. Every page in the window becomes readable after one drain.
+
+### Command-processor waits
+
+- **WAIT_REG_MEM** (graphicsRun.cpp:337-348) reads the address on the CPU. If the page is
+  GPU-dirty, that read is a Thread_Gpu self-fault with a full drain. If the value does not match,
+  the queue is suspended. When every queue is blocked, `ThreadRun` waits
+  `m_work_available.WaitFor(…, 100)` (graphicsRun.cpp:505-513), which is 1 ms on Windows because
+  `CondVar::WaitFor` rounds sub-millisecond waits up to 1 ms (threads.cpp:387). Guest label writes
+  from the CPU do not signal `m_work_available`, so a blocked queue is re-checked only by that
+  poll, by a new submission, or by a command.
+- **CE/DE counters** (graphicsRun.cpp:286-297) suspend the same way.
+- **SET_PREDICATION** with `wait_op` goes through `SynchronizePredicate`; see the first survey.
+- **COND_EXEC-style reads** (pm4Handlers.cpp:1479) and indirect draw/dispatch arguments
+  (graphicsRun.cpp:928-1125) dereference guest memory on the CPU and self-fault if it is
+  GPU-dirty.
+
+What to count: blocked-queue polls per second and their total time, suspended packets by opcode,
+and self-faults by opcode.
+
+### Per-draw CPU cost (other than materialization)
+
+For each draw (`DrawIndex`, renderDraw.cpp:1189-1298):
+- `PopPendingOperations`, which always calls `vkGetSemaphoreCounterValue`
+  (commandScheduler.cpp:211);
+- the `RenderContext::m_mutex` lock;
+- `RefreshShaders` → `GetGraphicsPrograms` (key building, materialization, permutation search);
+- colour and depth `FindImage` lookups;
+- `PrepareBindings` for every stage, then `PrepareGraphicsBindings` (buffer and texture
+  resolution, BDA sync when needed);
+- `AcquireVertexBuffers` and `ObtainBuffer` for indices; 8-bit indices are expanded on the CPU
+  into a `std::vector` (renderDraw.cpp:1263-1273);
+- `AcquireRenderTargets`;
+- `GetGraphicsPipeline` (a ~720-byte key hashed byte by byte);
+- `CommitBindings` (push descriptors), dynamic state, `BeginRendering`, `bindPipeline` and the
+  draw itself.
+
+`SetVulkanObjectNameF` and `LogDrawPhase` return early unless debug dumps are on, so they are
+free.
+
+The fault-buffer parser (faultManager.cpp:77-149) is dispatched once per completed submission that
+used BDA. It covers `CACHING_NUMPAGES / 32` = 2M threads, scanning the whole 8 MiB bitmap each
+time. That is GPU time, not CPU, and the GPU is not the bottleneck today.
+
+### Host synchronization
+
+- `MasterSemaphore::Wait` (masterSemaphore.cpp:38-55) checks the cached tick, refreshes, and then
+  blocks in `vkWaitSemaphores`. The AMD driver implements that wait with a kernel event (the
+  `NtWaitForSingleObject` leaves in the sample), so wake-up latency after the GPU signals is
+  scheduler-bound, typically tens of µs.
+- The priority thread (commandScheduler.cpp:268-295) is a default-priority thread that host-waits
+  each op's tick, then runs it. Each drain needs two wake-ups: the waiter, and the priority thread
+  for `WriteBacking`. The waiter then needs a third wake-up through `m_operation_available` in
+  `WaitPriorityOperations`.
+- `Submit` holds `queue_mutex` across `vkQueueSubmit` (commandScheduler.cpp:359-380).
+  `vkQueuePresentKHR` holds the same mutex (swapchain.cpp:696-699), so a present in progress
+  delays the submit inside every drain.
+- `CondVar::WaitFor` on Windows uses `SleepConditionVariableCS` with millisecond granularity and
+  rounds anything under 1 ms up to 1 ms (threads.cpp:379-396).
+
+### Frame pacing
+
+- The VideoOut `PresentThread` (videoOut.cpp:801-874) is both the vblank generator and the
+  presenter. Each 60 Hz period it runs `VblankBegin`, then `Flip(0)`, then `VblankEnd`.
+  `Flip(0)` with an empty queue calls `WaitFor(…, 0)`, which sleeps 1 ms on Windows
+  (videoOut.cpp:1113, threads.cpp:387). Vblank-end events therefore arrive at least 1 ms after
+  vblank-begin whenever no flip is ready.
+- `Present` (swapchain.cpp:781-819) takes `RenderContext::m_mutex` to record and submit the blit
+  (swapchain.cpp:798-804). Thread_Gpu holds that mutex for the whole of every draw and dispatch,
+  including drains inside them. The present, and the `VblankEnd` event after it, can therefore
+  slip by as long as one drain.
+- The default present mode is Mailbox (emulatorConfig.h:49). `vkAcquireNextImageKHR` uses an
+  infinite timeout, which is normally non-blocking with Mailbox.
+- The window title reports game fps as fresh frames. At about 27 fps the game flips on roughly
+  every other 60 Hz vblank, so a frame slightly over 33.3 ms costs a whole vblank. That is
+  consistent with the observed jumps between about 20 and 40 fps.
+
+### Upstream PR performance triage (refreshed September 25)
+
+Upstream `main` has not moved since 5a705dd. These open PRs changed since the first snapshot and
+touch performance:
+- **#822** (AudioOut write cadence, 28 lines): paces blocking audio writes to one buffer period.
+  This is an audio-quality fix. It adds sleeps to the guest audio thread, which is not on the
+  frame's critical path. Neutral for fps. It can be ported for audio if wanted.
+- **#789** (FNAF memory fixes): validates every buffer and sampler descriptor inside
+  `MaterializeResources`, which runs per draw (see above). It adds a `ClampRangeSize` lookup per
+  buffer per draw. Correctness work that would make the hot path slower. Do not port as is.
+- **#720** (Astro Bot Intel compatibility): x86 instruction emulation for Intel CPUs, plus
+  audio-pointer validation with a VirtualQuery per `AudioOutOutputs` call. It does nothing for the
+  7800X3D. Skip.
+- **#748** (async logging, VMA and Tracy frame profiling, macOS ARM): the Tracy frame markers could
+  help measurement, but the PR is mostly platform work. Take the ideas, not the commits.
+- **#719** (asynchronous logger): only matters with file logging, which should stay off for
+  timing.
+- **#715, #741, #727, #643** (carbonimax graphics series: native PerVertex replay, mesh-output
+  pruning, wave32 NGG): large, and conflict heavily with this branch's renderer. #741 can reduce
+  GPU mesh-shader work, but the GPU is not the bottleneck.
+- **#811** (address-backed indirect image descriptors): changes resource tracking and
+  materialization. Re-measure per-draw cost if it lands upstream.
+- **#558** (Astro Bot RT and an "SRT plan bug that dropped its lighting"): the SRT fix may matter
+  for correctness with the non-RT patch. Needs a separate look.
+
+No open PR addresses the drains, the per-draw materialization cost, or the Thread_Gpu
+bottleneck.
+
+### Profiling notes
+
+The September 24 stacks had implausible frames (for example `RangeSet::Subtract` calling
+`CommandScheduler::Wait`) because ThinLTO inlining and identical-code folding merge functions, and
+`SymFromAddr` returns only the outer symbol. The sampler should resolve inline frames
+(`SymAddrIncludeInlineTrace`, `SymQueryInlineTrace`, `SymFromInlineContext`) and file:line
+(`SymGetLineFromInlineContext`) before anyone attributes time at the call-site level.
