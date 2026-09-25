@@ -58,6 +58,7 @@ const char* KindName(Kind kind) {
 		case Kind::ReadbackClean: return "readback-clean";
 		case Kind::DccMetaWrite: return "dcc-meta-write";
 		case Kind::DccCheck: return "dcc-check";
+		case Kind::DccGpuCheck: return "dcc-gpu-check";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -209,10 +210,11 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}ms avg={:.3f}ms\n",
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
 			                    row.count, ms, ms / static_cast<double>(row.count));
-		} else if (row.kind == Kind::DccCheck) {
-			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} cleared-slices={}\n",
-			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
-			                    row.count, row.value);
+		} else if (row.kind == Kind::DccCheck || row.kind == Kind::DccGpuCheck) {
+			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {}={}\n", KindName(row.kind),
+			                    ReasonName(row.reason), OpName(row.op), row.count,
+			                    row.kind == Kind::DccCheck ? "cleared-slices" : "slices",
+			                    row.value);
 		} else {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}MiB\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count,

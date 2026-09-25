@@ -42,6 +42,7 @@ enum class Kind : uint8_t {
 	ReadbackClean, // ReadMemory found nothing to download.
 	DccMetaWrite,  // A GPU write covered known DCC metadata; the value is its size in bytes.
 	DccCheck,      // A DCC lookup read GPU-written metadata; the value is slices it cleared.
+	DccGpuCheck,   // A DCC lookup checked GPU-written metadata on the GPU; the value is slices.
 	Count,
 };
 

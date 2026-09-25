@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/dccClearResolver.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -70,6 +71,9 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	// Drain statistics only: native DCC metadata ranges seen by image lookups.
 	[[nodiscard]] bool IsKnownDccMetadata(uint64_t address, uint64_t size);
+	// A GPU write was recorded to guest memory. DCC slices checked on the GPU before it must be
+	// checked again.
+	void OnBufferGpuWrite(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
@@ -147,6 +151,15 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// Applies clears found in GPU-written DCC metadata with conditional rendering. Returns false
+	// when the target needs the CPU readback path.
+	[[nodiscard]] bool MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                            uint64_t slices_address, uint64_t slice_size,
+	                                            uint32_t image_first, uint32_t count);
+	[[nodiscard]] bool DccSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
+	                                    uint32_t code_mask);
+	void MarkDccSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
+	                          uint32_t code_mask);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -185,6 +198,17 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	RangeSet                                          m_dcc_metadata_seen;
+	struct DccCheckedSlice {
+		uint64_t size      = 0;
+		uint32_t code_mask = 0;
+	};
+	DccClearResolver                   m_dcc_resolver;
+	bool                               m_dcc_gpu_clear  = false;
+	uint64_t                           m_dcc_gpu_checks = 0;
+	// Slice address -> slices whose GPU check still reflects the metadata. Any recorded GPU write
+	// to the slice erases its entry; CPU writes leave the metadata CPU-dirty, which bypasses it.
+	std::mutex                         m_dcc_checked_mutex;
+	std::map<uint64_t, DccCheckedSlice> m_dcc_checked;
 	std::mutex                                        m_pending_download_mutex;
 	std::vector<GuestRange>                           m_pending_downloads;
 	uint64_t                                          m_total_used_memory  = 0;

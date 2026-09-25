@@ -482,6 +482,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		m_texture_cache.OnBufferGpuWrite(vaddr, size);
 		if (DrainStats::Enabled() && m_texture_cache.IsKnownDccMetadata(vaddr, size)) {
 			DrainStats::Record(DrainStats::Kind::DccMetaWrite, size);
 		}

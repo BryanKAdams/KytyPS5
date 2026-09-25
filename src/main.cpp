@@ -83,6 +83,8 @@ static void PrintUsage() {
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --drain-stats <seconds>              Report GPU waits by cause every N seconds.\n");
+	::printf("  --dcc-gpu-clear <true|false>         Apply GPU-written DCC clears on the GPU. "
+	         "Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -353,6 +355,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.drain_stats_interval = interval;
+		} else if (arg == "--dcc-gpu-clear") {
+			if (!ParseBool(value, options.config.dcc_gpu_clear_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

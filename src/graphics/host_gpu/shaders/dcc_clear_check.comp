@@ -1,0 +1,68 @@
+#version 450
+
+// Decides on the GPU whether GPU-written DCC metadata holds a fast clear, so the CPU never waits
+// for it. One workgroup inspects one metadata slice. A slice clears only when every byte holds
+// the same code and that code is in the caller's decodable set. The caller turns the predicates
+// into conditional clears; a consumed slice is rewritten to 0xff (uncompressed), matching the
+// CPU path.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer metadata_buf {
+    uint metadata[];
+};
+
+layout(std430, binding = 1) writeonly buffer predicate_buf {
+    uint predicates[];
+};
+
+layout(push_constant) uniform Params {
+    uint first_word;   // Metadata word of slice 0, relative to the binding.
+    uint slice_words;  // Words per slice.
+    uint code_mask;    // Bit k set: code k (see CodeIndex) has a decodable clear color.
+    uint consume;      // Nonzero: rewrite a cleared slice to 0xff.
+} params;
+
+const uint CODE_COUNT = 5u;
+
+shared uint uniform_slice;
+
+uint CodeIndex(uint code) {
+    switch (code) {
+        case 0x00u: return 0u;
+        case 0x20u: return 1u;
+        case 0x40u: return 2u;
+        case 0x80u: return 3u;
+        case 0xc0u: return 4u;
+        default: return CODE_COUNT;
+    }
+}
+
+void main() {
+    const uint slice = gl_WorkGroupID.x;
+    const uint lane  = gl_LocalInvocationIndex;
+    const uint base  = params.first_word + slice * params.slice_words;
+    const uint code  = metadata[base] & 0xffu;
+    const uint pattern = code * 0x01010101u;
+    if (lane == 0u) {
+        uniform_slice = 1u;
+    }
+    barrier();
+    for (uint i = lane; i < params.slice_words; i += gl_WorkGroupSize.x) {
+        if (metadata[base + i] != pattern) {
+            atomicAnd(uniform_slice, 0u);
+        }
+    }
+    barrier();
+    const uint index   = CodeIndex(code);
+    const bool cleared = uniform_slice != 0u && index < CODE_COUNT &&
+                         (params.code_mask & (1u << index)) != 0u;
+    if (lane < CODE_COUNT) {
+        predicates[slice * CODE_COUNT + lane] = cleared && lane == index ? 1u : 0u;
+    }
+    if (cleared && params.consume != 0u) {
+        for (uint i = lane; i < params.slice_words; i += gl_WorkGroupSize.x) {
+            metadata[base + i] = 0xffffffffu;
+        }
+    }
+}

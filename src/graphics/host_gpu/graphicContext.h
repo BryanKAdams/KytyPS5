@@ -33,6 +33,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                                      attachment_feedback_loop_dynamic_enabled = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// VK_EXT_conditional_rendering: lets GPU-written DCC clear keys be applied without readback.
+	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

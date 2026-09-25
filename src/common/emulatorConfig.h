@@ -73,6 +73,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
 	uint32_t               drain_stats_interval        = 0;
+	bool                   dcc_gpu_clear_enabled       = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -122,6 +123,8 @@ bool TessellationEnabled();
 bool PlayGoHackEnabled();
 // Seconds between GPU wait reports; 0 disables the accounting.
 uint32_t GetDrainStatsInterval();
+// Apply GPU-written DCC fast clears on the GPU instead of reading the keys back.
+bool DccGpuClearEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

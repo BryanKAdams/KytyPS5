@@ -179,8 +179,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
+      m_buffer_cache(buffer_cache), m_dcc_resolver(graphics, scheduler),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+	m_dcc_gpu_clear = Config::DccGpuClearEnabled() && m_dcc_resolver.Available();
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -1212,15 +1213,19 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: DCC view exceeds its native metadata slices\n");
 	}
+	const auto slice_size  = range.size / layers;
+	const bool gpu_written = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	if (gpu_written && MaterializeDccClearOnGpu(id, desc, range.address + slice_size * first,
+	                                            slice_size, image_first, count)) {
+		return;
+	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	const bool gpu_written = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
 	if (gpu_written) {
 		DrainStats::ReasonScope reason(DrainStats::Reason::DccClear);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	uint64_t   cleared_slices = 0;
-	const auto slice_size     = range.size / layers;
+	uint64_t cleared_slices = 0;
 	struct CheckRecord {
 		bool      record;
 		uint64_t& cleared;
@@ -1260,6 +1265,157 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		if (desc.type != BindingType::VideoOut) {
 			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
 		}
+	}
+}
+
+bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
+                                            uint64_t slices_address, uint64_t slice_size,
+                                            uint32_t image_first, uint32_t count) {
+	// Render targets only: their keys are always consumed, so each GPU write is checked once.
+	const auto& view = desc.view_info;
+	if (!m_dcc_gpu_clear || desc.type != BindingType::RenderTarget || desc.info.IsVolume() ||
+	    count == 0 || count > DccClearResolver::MaxSlices || view.base_level != 0 ||
+	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+		return false;
+	}
+	std::array<vk::ClearColorValue, DccClearResolver::CodeCount> colors {};
+	uint32_t                                                     code_mask = 0;
+	for (uint32_t index = 0; index < DccClearResolver::CodeCount; index++) {
+		if (DecodeDccClear(desc, DccClearResolver::Code(index), colors[index])) {
+			code_mask |= 1u << index;
+		}
+	}
+	if (code_mask == 0) {
+		// No key clears this view, so the metadata bytes cannot change the image.
+		return true;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.depth_id || image.backing.image == nullptr ||
+		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) ||
+		    image_first >= image.backing.layers || count > image.backing.layers - image_first) {
+			return false;
+		}
+	}
+	if (DccSlicesChecked(slices_address, slice_size, count, code_mask)) {
+		return true;
+	}
+	m_dcc_gpu_checks++;
+	{
+		DrainStats::ReasonScope reason(DrainStats::Reason::DccClear);
+		DrainStats::Record(DrainStats::Kind::DccGpuCheck, count);
+	}
+	// The check consumes cleared slices on the GPU, so the metadata stays GPU-owned.
+	const auto [metadata, metadata_offset] =
+	    m_buffer_cache.ObtainBuffer(slices_address, slice_size * count, true, false);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	m_dcc_resolver.Record(native, *metadata, metadata_offset, slice_size, count, code_mask, true);
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		TrackImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			// A predicated clear may not happen, so the image must already hold guest contents.
+			InitializeImage(id);
+			if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
+				EXIT("TextureCache: DCC clear target retained guest ownership\n");
+			}
+		}
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentRead |
+		                  vk::AccessFlagBits2::eColorAttachmentWrite,
+		              {}, native);
+		ImageViewInfo attachment_view {};
+		attachment_view.format      = view.format;
+		attachment_view.type        = count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+		attachment_view.base_layer  = image_first;
+		attachment_view.layer_count = count;
+		attachment_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = image.FindView(attachment_view);
+		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		const vk::Extent2D extent {image.info.extent.width, image.info.extent.height};
+		vk::RenderingInfo  rendering {};
+		rendering.renderArea.extent    = extent;
+		rendering.layerCount           = count;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &attachment;
+		native.beginRendering(&rendering);
+		for (uint32_t slice = 0; slice < count; slice++) {
+			for (uint32_t index = 0; index < DccClearResolver::CodeCount; index++) {
+				if ((code_mask & (1u << index)) == 0) {
+					continue;
+				}
+				vk::ConditionalRenderingBeginInfoEXT condition {};
+				condition.buffer = m_dcc_resolver.PredicateBuffer();
+				condition.offset = DccClearResolver::PredicateOffset(slice, index);
+				native.beginConditionalRenderingEXT(&condition);
+				const vk::ClearAttachment clear {vk::ImageAspectFlagBits::eColor, 0,
+				                                 vk::ClearValue {colors[index]}};
+				const vk::ClearRect       rect {vk::Rect2D {{0, 0}, extent}, slice, 1};
+				native.clearAttachments(1, &clear, 1, &rect);
+				native.endConditionalRenderingEXT();
+			}
+		}
+		native.endRendering();
+		// Transit does not separate attachment writes in the same layout; order the clears
+		// before the draw that follows.
+		vk::MemoryBarrier2 ordered {};
+		ordered.srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+		ordered.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+		ordered.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		ordered.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &ordered;
+		native.pipelineBarrier2(dependency);
+		CommitGpuWrite(image);
+	}
+	MarkDccSlicesChecked(slices_address, slice_size, count, code_mask);
+	return true;
+}
+
+bool TextureCache::DccSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
+                                    uint32_t code_mask) {
+	std::scoped_lock lock {m_dcc_checked_mutex};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		const auto found = m_dcc_checked.find(address + slice_size * slice);
+		if (found == m_dcc_checked.end() || found->second.size != slice_size ||
+		    (found->second.code_mask & code_mask) != code_mask) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void TextureCache::MarkDccSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
+                                        uint32_t code_mask) {
+	std::scoped_lock lock {m_dcc_checked_mutex};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		m_dcc_checked[address + slice_size * slice] = {slice_size, code_mask};
+	}
+}
+
+void TextureCache::OnBufferGpuWrite(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_dcc_checked_mutex};
+	if (m_dcc_checked.empty() || size == 0) {
+		return;
+	}
+	auto entry = m_dcc_checked.lower_bound(address);
+	if (entry != m_dcc_checked.begin()) {
+		const auto previous = std::prev(entry);
+		if (previous->first + previous->second.size > address) {
+			entry = previous;
+		}
+	}
+	while (entry != m_dcc_checked.end() && entry->first < address + size) {
+		entry = m_dcc_checked.erase(entry);
 	}
 }
 
@@ -2099,6 +2255,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
+	OnBufferGpuWrite(address, size);
 	std::scoped_lock lock {m_lock};
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;

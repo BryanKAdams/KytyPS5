@@ -222,6 +222,16 @@ struct TextureCacheTestAccess {
     cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
   }
 
+  // Selects the GPU (conditional rendering) or CPU readback path for GPU-written DCC keys.
+  static bool SetDccGpuClear(TextureCache &cache, bool enabled) {
+    cache.m_dcc_gpu_clear = enabled && cache.m_dcc_resolver.Available();
+    return cache.m_dcc_gpu_clear;
+  }
+
+  static uint64_t DccGpuChecks(const TextureCache &cache) {
+    return cache.m_dcc_gpu_checks;
+  }
+
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
@@ -9022,8 +9032,9 @@ public:
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "fixed-clear direct mapping failed");
+    // Both paths must agree: conditional clears on the GPU, and the CPU readback fallback.
+    for (const bool gpu_clear : {true, false}) {
     std::memset(mapped, 0, allocation_size);
-
     for (const auto &fill_case : cases) {
       RenderContext context(m_runtime_context);
       HW::Context registers{};
@@ -9031,6 +9042,11 @@ public:
       HW::Shader shaders{};
       context.InitializeGpu(nullptr);
       LibKernel::Memory::InstallGpuResources(&context);
+      const bool gpu_path =
+          TextureCacheTestAccess::SetDccGpuClear(context.GetTextureCache(), gpu_clear);
+      Require(name, "DCC clear path selection",
+              gpu_path == (gpu_clear && m_conditional_rendering_supported),
+              "the GPU DCC clear path did not follow conditional-rendering support");
       context.GetGpu().SendCommandSync([&] {
         auto &scheduler = context.GetCommandScheduler();
         registers.SetColorBase(0, {.addr = base});
@@ -9225,12 +9241,16 @@ public:
                     std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
                                 [](uint8_t byte) { return byte == 0xff; }),
                 "the former HTile entry swallowed the native DCC fill dispatch");
+        Require(name, gpu_path ? "GPU DCC path used" : "CPU DCC path used",
+                (TextureCacheTestAccess::DccGpuChecks(texture_cache) != 0) == gpu_path,
+                "GPU-written DCC keys took the wrong materialization path");
         RenderExecutorTestAccess::ResetBindings(executor);
         resources.UnmapMemory(base, allocation_size);
         scheduler.Finish();
       });
       context.ShutdownGpu();
       LibKernel::Memory::InstallGpuResources(nullptr);
+    }
     }
 
     Require(name, "unmap direct backing",
@@ -15744,6 +15764,8 @@ private:
         m_feedback_dynamic_supported;
     m_runtime_context.provoking_vertex_last_enabled =
         m_provoking_vertex_supported;
+    m_runtime_context.conditional_rendering_enabled =
+        m_conditional_rendering_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -15888,8 +15910,10 @@ private:
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional_rendering{};
+    available_conditional_rendering.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
-    available_min_lod.pNext = &available_provoking_vertex;
+    available_min_lod.pNext = &available_conditional_rendering;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
@@ -15970,11 +15994,15 @@ private:
     m_provoking_vertex_supported =
         available_provoking_vertex.provokingVertexLast &&
         has_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    m_conditional_rendering_supported =
+        available_conditional_rendering.conditionalRendering &&
+        has_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     std::printf("[host] Optional features: attachment feedback=%s, dynamic "
-                "feedback=%s, provoking vertex last=%s\n",
+                "feedback=%s, provoking vertex last=%s, conditional rendering=%s\n",
                 m_feedback_loop_supported ? "yes" : "no",
                 m_feedback_dynamic_supported ? "yes" : "no",
-                m_provoking_vertex_supported ? "yes" : "no");
+                m_provoking_vertex_supported ? "yes" : "no",
+                m_conditional_rendering_supported ? "yes" : "no");
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -16028,8 +16056,14 @@ private:
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
     provoking_vertex.pNext = &feedback_dynamic;
     provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
+    conditional_rendering.conditionalRendering = true;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
     min_lod.pNext = &color_write;
+    if (m_conditional_rendering_supported) {
+      conditional_rendering.pNext = min_lod.pNext;
+      min_lod.pNext = &conditional_rendering;
+    }
     if (m_feedback_loop_supported) {
       feedback_layout.pNext = min_lod.pNext;
       min_lod.pNext = &feedback_layout;
@@ -16084,6 +16118,9 @@ private:
     }
     if (m_provoking_vertex_supported) {
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_conditional_rendering_supported) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
@@ -16418,6 +16455,7 @@ private:
   bool m_feedback_loop_supported = false;
   bool m_feedback_dynamic_supported = false;
   bool m_provoking_vertex_supported = false;
+  bool m_conditional_rendering_supported = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
