@@ -68,7 +68,7 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}:opt={}\n", KYTY_GIT_REVISION,
+	return fmt::format("KytyPC3:{}:{:08x}:{:08x}:{:08x}:{}:opt={}\n", KYTY_SHADER_CACHE_KEY,
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid,
 	                   static_cast<uint32_t>(Config::GetShaderOptimizationType()));
 }
@@ -444,14 +444,10 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+	// The key hashes the recompiler and pipeline sources, including uncommitted edits, so records
+	// written by different shader code never match.
+	if (std::string_view(KYTY_SHADER_CACHE_KEY) == "unknown") {
+		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown shader source key)");
 		return;
 	}
 
@@ -522,8 +518,8 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::InitializeShaderPrecompile() {
-	// Reuse the existing clean Release/revision/driver gate. In particular, a dirty build
-	// must never replay compiler inputs left by different source with the same commit ID.
+	// Reuse the Release/source-key/driver gate: records from different recompiler or pipeline
+	// sources carry a different key and are discarded.
 	if (!Config::ShaderPrecompileEnabled() || m_driver_cache == nullptr ||
 	    m_driver_cache_path.empty())
 		return;

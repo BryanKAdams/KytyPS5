@@ -104,9 +104,11 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 --shader-precompile false     Disable journal recording/replay for comparison or recovery.
 ```
 
-The driver cache and shader journal require a clean Release build with a known Git revision.
-Changing source revision or GPU/driver identity invalidates compatibility; shader records also include
-the game version. A modified, uncommitted development build intentionally disables these caches.
+The driver cache and shader journal require a Release build. They are keyed on a SHA-256 of the
+recompiler and pipeline sources (`src/graphics/shader/**` and
+`src/graphics/host_gpu/renderer/pipeline/**`, including uncommitted edits) and on the GPU/driver
+identity; shader records also include the game version. Commits that do not touch those sources keep
+a title's caches valid, so A/B builds can be measured warm; any change to them invalidates both files.
 The journal detects checksum damage and interrupted writes, but is not an authenticated format for
 importing arbitrary third-party shader records. Deleting a title's `.shaders` file or disabling replay
 is the recovery path for a problematic record set.

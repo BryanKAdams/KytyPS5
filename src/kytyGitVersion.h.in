@@ -5,6 +5,8 @@
 #define KYTY_GIT_HASH "@KYTY_GIT_HASH@"
 // Full commit identity used for compatibility checks.
 #define KYTY_GIT_REVISION "@KYTY_GIT_REVISION@"
+// SHA-256 of the recompiler and pipeline sources; keys the per-title shader caches.
+#define KYTY_SHADER_CACHE_KEY "@KYTY_SHADER_CACHE_KEY@"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)
