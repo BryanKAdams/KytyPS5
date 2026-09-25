@@ -88,6 +88,194 @@ void TestStreamingResample() {
 	      "streaming progress does not match consumed source data");
 }
 
+void TestAtrac9ResampleAcrossFrames() {
+	const auto make_voice = [] {
+		auto f = std::make_unique<Fixture>(24000);
+		f->voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
+		f->voice.state = Ngs2VoicePlayState::Playing;
+		f->voice.decoded_frame[0] = 0.0f;
+		f->voice.decoded_frame[1] = 0.5f;
+		f->voice.frame_samples = 2;
+		f->voice.next_decoded_frame.resize(f->voice.decoded_frame.size());
+		f->voice.next_decoded_frame[0] = 1.0f;
+		f->voice.next_decoded_frame[1] = 1.5f;
+		f->voice.next_frame_samples = 2;
+		f->voice.accepts_blocks = false;
+		return f;
+	};
+	auto whole = make_voice();
+	whole->Render(8);
+	const std::vector<float> expected {0.0f, 0.25f, 0.5f, 0.75f,
+	                                   1.0f, 1.25f, 1.5f, 1.5f};
+	Check(whole->voice.samples == expected && whole->voice.decoded_samples == 4 &&
+	          whole->voice.state == Ngs2VoicePlayState::Empty,
+	      "24 kHz ATRAC9 interpolation or source progress failed at frame boundary");
+	auto split = make_voice();
+	split->Render(3);
+	const auto first = split->voice.samples;
+	split->Render(5);
+	std::vector<float> joined = first;
+	joined.insert(joined.end(), split->voice.samples.begin(), split->voice.samples.end());
+	Check(joined == expected && split->voice.decoded_samples == 4,
+	      "ATRAC9 resampling changed across render grains");
+	auto pitched = make_voice();
+	struct Pitch {
+		Ngs2VoiceParamHeader header {16, 0, 0x10000005};
+		float                ratio    = 2.0f;
+		uint32_t             reserved = 0;
+	} pitch;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&pitched->voice), &pitch.header) == OK,
+	      "ATRAC9 pitch control failed");
+	pitched->Render(4);
+	Check(pitched->voice.samples == std::vector<float> {0.0f, 0.5f, 1.0f, 1.5f} &&
+	          pitched->voice.decoded_samples == 4,
+	      "ATRAC9 pitch did not use source-rate phase advancement");
+}
+
+void TestAtrac9ResampleAfterStarvation() {
+	Fixture f(24000);
+	f.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
+	f.voice.state            = Ngs2VoicePlayState::Playing;
+	f.voice.accepts_blocks   = true;
+	f.voice.decoded_frame[0] = 0.0f;
+	f.voice.decoded_frame[1] = 0.5f;
+	f.voice.frame_samples    = 2;
+	f.Render(4);
+	Check(f.voice.samples == std::vector<float> {0.0f, 0.25f, 0.5f, 0.5f} &&
+	          f.voice.decoded_samples == 2,
+	      "ATRAC9 resampling lost the final sample before starvation");
+	f.Render(2);
+	Check(!f.voice.has_samples && f.voice.state == Ngs2VoicePlayState::Playing &&
+	          f.voice.decoded_samples == 2,
+	      "starved ATRAC9 stream consumed source samples");
+	f.voice.next_decoded_frame.resize(f.voice.decoded_frame.size());
+	f.voice.next_decoded_frame[0] = 1.0f;
+	f.voice.next_decoded_frame[1] = 1.5f;
+	f.voice.next_frame_samples    = 2;
+	f.Render(4);
+	Check(f.voice.samples == std::vector<float> {1.0f, 1.25f, 1.5f, 1.5f} &&
+	          f.voice.decoded_samples == 4,
+	      "ATRAC9 refill lost source-rate phase");
+}
+
+void TestWaveformBlockGeometry() {
+	const Ngs2WaveformFormat format {NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0};
+	Ngs2WaveformBlock block {};
+	Check(Ngs2CalcWaveformBlock(&format, 0, 34534, &block) == OK &&
+	          block.data_offset == 0 && block.data_size == 13056 &&
+	          block.num_skip_samples == 0 && block.num_samples == 34534,
+	      "ATRAC9 block calculation omitted encoded superframes");
+	Check(Ngs2CalcWaveformBlock(&format, 513, 1, &block) == OK &&
+	          block.data_offset == 192 && block.data_size == 192 &&
+	          block.num_skip_samples == 1 && block.num_samples == 1,
+	      "ATRAC9 block calculation lost the source offset");
+	Check(Ngs2CalcWaveformBlock(&format, 0, 0, &block) == OK && block.data_size == 0 &&
+	          block.num_samples == 0,
+	      "empty ATRAC9 block acquired encoded data");
+	Fixture f(24000);
+	const int16_t silence = 0;
+	f.Queue(&silence, 0, 0, UINT32_MAX);
+	f.Render(1);
+	Check(f.voice.blocks.empty() && f.voice.state == Ngs2VoicePlayState::Empty,
+	      "empty repeated block kept the sampler active");
+}
+
+void TestSubmixerSetupAndRouting() {
+	Fixture f(48000, 2);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs                         = &f.system;
+	submixer_rack.type                        = Ngs2RackType::Submixer;
+	submixer_rack.option.submixer.max_channels = 8;
+	Ngs2VoiceInternal submixer;
+	submixer.rack = &submixer_rack;
+	submixer.ports.resize(1);
+	submixer.matrices.resize(1);
+	Ngs2RackInternal mastering_rack {};
+	mastering_rack.type = Ngs2RackType::Mastering;
+	Ngs2VoiceInternal mastering;
+	mastering.rack     = &mastering_rack;
+	mastering.channels = 2;
+	mastering.state    = Ngs2VoicePlayState::Playing;
+	submixer.state         = Ngs2VoicePlayState::Playing;
+	submixer.ports[0].dest = &mastering;
+	submixer.matrices[0]  = {1.0f};
+	f.voice.ports.push_back({&submixer, 0, 1.0f, -1});
+	const int16_t pcm[] = {8192, -8192, 16384, -16384};
+	f.Queue(pcm, 2, 0);
+	const std::vector<Ngs2VoiceInternal*> voices {&f.voice, &submixer, &mastering};
+	Ngs2RenderVoice(mastering, voices, 1);
+	Check(!submixer.has_samples && !mastering.has_samples && f.voice.decoded_samples == 0,
+	      "unconfigured zero-channel submixer claimed to produce samples");
+	Ngs2SubmixerVoiceSetupParam setup {{16, 0, 0x20000000}, 2, 0};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&submixer), &setup.header) == OK &&
+	          submixer.channels == 2 && submixer.state == Ngs2VoicePlayState::Empty &&
+	          submixer.ports[0].dest == nullptr && submixer.matrices[0].empty(),
+	      "submixer setup did not establish channels and clear old routing");
+	submixer.state = Ngs2VoicePlayState::Playing;
+	submixer.ports[0] = {&mastering, 0, 1.0f, 0};
+	submixer.matrices[0] = {1.0f, 0.0f, 0.0f, 1.0f};
+	for (float expected: {0.25f, 0.5f}) {
+		for (auto* voice: voices) {
+			voice->rendered = false;
+		}
+		Ngs2RenderVoice(mastering, voices, 1);
+		Check(mastering.has_samples && mastering.samples[0] == expected &&
+		          mastering.samples[1] == -expected,
+		      "submixer lost routed samples across render grains");
+	}
+}
+
+void TestPcm16RenderOutput() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 4;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 2;
+	sampler_option.common.max_ports  = 1;
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte sampler_storage[sizeof(Ngs2RackInternal) + 2 * sizeof(Ngs2VoiceInternal)];
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte mastering_storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
+	Ngs2ContextBufferInfo sampler_buffer {sampler_storage, sizeof(sampler_storage)};
+	Ngs2ContextBufferInfo mastering_buffer {mastering_storage, sizeof(mastering_storage)};
+	uintptr_t sampler_handle = 0, mastering_handle = 0;
+	const auto system_handle = reinterpret_cast<uintptr_t>(&system);
+	Check(Ngs2RackCreate(system_handle, 0x1000, &sampler_option.common, &sampler_buffer,
+	                     &sampler_handle) == OK &&
+	          Ngs2RackCreate(system_handle, 0x3000, &mastering_option.common,
+	                         &mastering_buffer, &mastering_handle) == OK,
+	      "PCM16 render rack creation failed");
+	auto* samplers = reinterpret_cast<Ngs2VoiceInternal*>(
+	    reinterpret_cast<Ngs2RackInternal*>(sampler_handle) + 1);
+	auto& mastering = *reinterpret_cast<Ngs2VoiceInternal*>(
+	    reinterpret_cast<Ngs2RackInternal*>(mastering_handle) + 1);
+	mastering.channels = 1;
+	mastering.state    = Ngs2VoicePlayState::Playing;
+	const int16_t source[2][4] = {{16384, -16384, 32767, -32768},
+	                              {8192, -8192, 32767, -32768}};
+	for (uint32_t i = 0; i < 2; ++i) {
+		samplers[i].SetupSampler({0x12, 1, 48000});
+		samplers[i].blocks.push_back(
+		    {reinterpret_cast<const uint8_t*>(source[i]), {0, sizeof(source[i]), 0, 0, 4}});
+		samplers[i].ports[0].dest = &mastering;
+		samplers[i].SetEvent(1);
+	}
+	int16_t output_samples[4] = {};
+	Ngs2RenderBufferInfo output {output_samples, sizeof(output_samples), 0x12, 1};
+	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
+	          output_samples[0] == 24576 && output_samples[1] == -24576 &&
+	          output_samples[2] == 32767 && output_samples[3] == -32768,
+	      "PCM16 output failed to mix or saturate mastering voices");
+	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
+	          std::ranges::all_of(output_samples, [](int16_t sample) { return sample == 0; }),
+	      "PCM16 output retained samples from the previous render");
+	Check(Ngs2RackDestroy(mastering_handle, nullptr) == OK &&
+	          Ngs2RackDestroy(sampler_handle, nullptr) == OK,
+	      "PCM16 render rack cleanup failed");
+}
+
 void TestPitchLoopAndSkip() {
 	Fixture       f(24000);
 	const int16_t pcm[] = {-30000, 8192, 16384};
@@ -104,6 +292,22 @@ void TestPitchLoopAndSkip() {
 		Check(std::abs(f.voice.samples[i] - expected[i]) < 0.00001f,
 		      "pitch, repeat count, or skipped samples incorrect");
 	}
+}
+
+void TestPitchClamps() {
+	Fixture       f(48000);
+	const int16_t pcm[] = {8192, 0, 0, 0, -8192};
+	f.Queue(pcm, 5, 0);
+	struct Pitch {
+		Ngs2VoiceParamHeader header {16, 0, 0x10000005};
+		float                ratio    = 5.0f;
+		uint32_t             reserved = 0;
+	} pitch;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &pitch.header) == OK,
+	      "out-of-range pitch was rejected");
+	f.Render(2);
+	Check(f.voice.samples[0] == 0.25f && f.voice.samples[1] == -0.25f,
+	      "pitch was not clamped to four times playback speed");
 }
 
 void TestStarvationAndPause() {
@@ -149,6 +353,27 @@ void TestMonoRateAndRouting() {
 	      "22.05 kHz effect duration was incorrect");
 }
 
+void TestMatrixOutputChannels() {
+	Fixture f(48000, 2);
+	Ngs2RackInternal mastering_rack {};
+	mastering_rack.type = Ngs2RackType::Mastering;
+	Ngs2VoiceInternal mastering;
+	mastering.rack     = &mastering_rack;
+	mastering.channels = 8;
+	mastering.state    = Ngs2VoicePlayState::Playing;
+	f.voice.matrices   = {{1.0f, 0.0f, 0.0f, 1.0f}};
+	f.voice.ports.push_back({&mastering, 0, 1.0f, 0});
+	const int16_t pcm[] = {8192, -8192};
+	f.Queue(pcm, 1, 0);
+	Ngs2RenderVoice(mastering, {&f.voice, &mastering}, 1);
+	Check(mastering.samples[0] == 0.25f && mastering.samples[1] == -0.25f,
+	      "stereo matrix did not route its output channels");
+	for (size_t channel = 2; channel < mastering.channels; ++channel) {
+		Check(mastering.samples[channel] == 0.0f,
+		      "matrix routed audio to an unspecified output channel");
+	}
+}
+
 void TestCustomPcmStillPlays() {
 	Fixture       f(48000, 1, Ngs2RackType::CustomSampler);
 	const int16_t pcm[] = {8192, -16384};
@@ -188,6 +413,29 @@ void TestSamplerReuseResetsRouting() {
 		Check(mastering.samples == std::vector<float> {0.25f, -0.25f, 0.5f, -0.5f},
 		      "reused stereo sampler did not restore default channel routing");
 	}
+}
+
+void TestDeferredSamplerSetup() {
+	Fixture f(48000);
+	struct Setup {
+		Ngs2VoiceParamHeader header {40, 0, 0x10000000};
+		Ngs2WaveformFormat   format;
+		uint32_t             flags = 0, reserved = 0;
+	} setup;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &setup.header) == OK,
+	      "deferred stream setup failed");
+	Check(f.voice.state == Ngs2VoicePlayState::Empty && f.voice.channels == 0 &&
+	          f.voice.sample_rate == 0 && f.voice.decoder == nullptr,
+	      "deferred stream setup did not clear the sampler");
+	setup.format = {0x12, 1, 48000};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &setup.header) == OK,
+	      "sampler setup after deferred stream failed");
+	const int16_t pcm = 8192;
+	f.Queue(&pcm, 1, 0);
+	f.voice.SetEvent(1);
+	f.Render(1);
+	Check(f.voice.samples[0] == 0.25f,
+	      "sampler did not play after deferred stream setup");
 }
 
 void TestPlayStateBeforeRender() {
@@ -270,7 +518,7 @@ void TestStopThenPlayBeforeRender() {
 void SetLowPass(Fixture& f, float frequency = 1000.0f, uint64_t mask = 0) {
 	struct Param {
 		Ngs2VoiceParamHeader   header {56, 0, 0x1000000a};
-		Ngs2SamplerFilterParam filter {0, 1, 0, 1, 1000.0f, 0.70710678f, 1.0f, {}};
+		Ngs2SamplerFilterParam filter {0, 1, 1, 0, 1000.0f, 0.70710678f, 1.0f, {}};
 	} param;
 	param.filter.frequency            = frequency;
 	param.filter.channel_mask         = mask;
@@ -366,8 +614,8 @@ void TestFilterControlLayout() {
 	Fixture f(48000, 2);
 	f.rack.option.sampler.max_filters = 8;
 	// A 56-byte control command with nonzero trailing padding.
-	alignas(8) uint32_t words[] = {56,         0x1000000a, 0,          1, 0, 0, 1,
-	                               0x45d58800, 0x3fd55555, 0x3f800000, 0, 0, 0, 0x13f};
+	alignas(8) uint32_t words[] = {56, 0x1000000a, 0, 1, 1, 0, 0,
+	                               0,  0x45d58800, 0x3fd55555, 0x3f800000, 0, 0, 0x13f};
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice),
 	                 reinterpret_cast<const Ngs2VoiceParamHeader*>(words));
 	Check(f.voice.filters.size() == 1 && f.voice.filters[0].enabled,
@@ -377,8 +625,8 @@ void TestFilterControlLayout() {
 	const double expected = (1 - std::cos(omega)) / (2 * (1 + std::sin(omega) / (2 * q)));
 	Check(std::abs(f.voice.filters[0].b0 - expected) < 1e-10,
 	      "FCQ fields were read at the wrong offsets");
-	words[4] = 1; // Bypass channel 0 in the low half of the 64-bit mask.
-	words[5] = 1; // Bypass channel 32 in the high half.
+	words[6] = 1; // Bypass channel 0 in the low half of the 64-bit mask.
+	words[7] = 1; // Bypass channel 32 in the high half.
 	Fixture wide(48000, 33);
 	wide.rack.option.sampler.max_filters = 8;
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&wide.voice),
@@ -389,8 +637,8 @@ void TestFilterControlLayout() {
 	Check(wide.voice.samples[0] == 0.5f && wide.voice.samples[32] == 0.5f &&
 	          std::abs(wide.voice.samples[1] - expected * 0.5) < 1e-7,
 	      "channel mask was not decoded as a 64-bit bypass mask");
-	words[6] = 0; // OFF ignores unused FCQ values and clears the old delay line.
-	words[7] = 0x7fc00000;
+	words[4] = 0; // OFF ignores unused FCQ values and clears the old delay line.
+	words[8] = 0x7fc00000;
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&wide.voice),
 	                 reinterpret_cast<const Ngs2VoiceParamHeader*>(words));
 	Check(!wide.voice.filters[0].enabled && wide.voice.filters[0].history.empty() &&
@@ -664,8 +912,14 @@ void TestFiniteFilterTail() {
 } // namespace
 
 int main() {
+	TestPcm16RenderOutput();
+	TestSubmixerSetupAndRouting();
+	TestWaveformBlockGeometry();
+	TestAtrac9ResampleAfterStarvation();
+	TestAtrac9ResampleAcrossFrames();
 	TestResamplingPhaseAfterStarvation();
 	TestSamplerReuseResetsRouting();
+	TestDeferredSamplerSetup();
 	TestLoopCallbacksAndExit();
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
@@ -679,8 +933,10 @@ int main() {
 	TestCallbackPauseDuringLargeStep();
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
+	TestPitchClamps();
 	TestStarvationAndPause();
 	TestMonoRateAndRouting();
+	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestPlayStateBeforeRender();
 	TestStatePublication();

@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -197,8 +198,8 @@ struct Ngs2WaveformFormat {
 	uint32_t num_channels  = 0;
 	uint32_t sample_rate   = 0;
 	uint32_t config_data   = 0;
-	uint32_t frame_margin  = 0;
 	uint32_t frame_offset  = 0;
+	uint32_t frame_margin  = 0;
 };
 
 struct Ngs2WaveformBlock {
@@ -388,18 +389,20 @@ struct Ngs2RackInternal {
 
 enum class Ngs2VoicePlayState : uint32_t { Empty = 0, Playing = 3, Paused = 5, Stopped = 0xb };
 
-// The 64-bit bypass mask precedes the filter type and FCQ parameters.
 struct Ngs2SamplerFilterParam {
 	uint32_t index;
 	uint32_t location;
-	uint64_t channel_mask;
 	uint32_t type;
+	uint64_t channel_mask;
 	float    frequency;
 	float    q;
 	float    level;
 	uint32_t reserved[3];
 };
 static_assert(sizeof(Ngs2SamplerFilterParam) == 48);
+static_assert(offsetof(Ngs2SamplerFilterParam, type) == 8 &&
+              offsetof(Ngs2SamplerFilterParam, channel_mask) == 16 &&
+              offsetof(Ngs2SamplerFilterParam, frequency) == 24);
 
 struct Ngs2SamplerFilter {
 	struct History {
@@ -507,7 +510,6 @@ struct Ngs2VoiceInternal {
 		Ngs2WaveformBlock info;
 		uint32_t          cursor         = 0;
 		size_t            data_cursor    = 0;
-		uint32_t          skip_remaining = info.num_skip_samples;
 		uint32_t          repeated_count = 0;
 	};
 	struct Module {
@@ -535,14 +537,21 @@ struct Ngs2VoiceInternal {
 	bool                            has_samples     = false;
 
 	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
-	std::vector<float>                 decoded_frame;
-	bool                               accepts_blocks  = true;
-	uint32_t                           sample_rate     = 0;
-	uint64_t                           sample_phase    = 0;
-	uint64_t                           sample_step     = 0;
-	uint64_t                           decoded_samples = 0;
-	uint64_t                           decoded_bytes   = 0;
-	const uint8_t*                      waveform_end    = nullptr;
+	std::vector<float>                  decoded_frame;
+	std::vector<float>                  next_decoded_frame;
+	std::vector<uint8_t>                compressed_input;
+	uint32_t                            frame_cursor       = 0;
+	uint32_t                            frame_samples      = 0;
+	uint32_t                            next_frame_samples = 0;
+	bool                                accepts_blocks     = true;
+	uint32_t                            sample_rate        = 0;
+	uint64_t                            sample_phase       = 0;
+	uint64_t                            sample_step        = 0;
+	uint64_t                            decoded_samples    = 0;
+	uint64_t                            decoded_bytes      = 0;
+	uint32_t                            duration_remaining = 0;
+	uint32_t                            skip_remaining     = 0;
+	const uint8_t*                      waveform_end       = nullptr;
 	std::vector<Ngs2SamplerFilter>      filters;
 
 	const uint8_t* WaveformData() const {
@@ -556,28 +565,44 @@ struct Ngs2VoiceInternal {
 		                               channels * sizeof(int16_t));
 	}
 
-	void SetupSampler(const Ngs2WaveformFormat& format) {
-		EXIT_NOT_IMPLEMENTED(format.frame_margin != 0 || format.frame_offset != 0 ||
-		                     format.sample_rate == 0 || format.num_channels == 0 ||
-		                     (format.waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9 &&
-		                      format.sample_rate != rack->ngs->option.sample_rate));
+	void ResetSetupState() {
 		SetEvent(4);
 		std::ranges::fill(ports, Port {});
 		for (auto& matrix: matrices) {
 			matrix.clear();
 		}
-		channels        = format.num_channels;
-		sample_rate     = format.sample_rate;
-		sample_phase    = 0;
-		sample_step     = uint64_t(sample_rate) << 32u;
-		decoded_samples = 0;
-		decoded_bytes   = 0;
-		waveform_end    = nullptr;
-		blocks.clear();
 		filters.clear();
+	}
+
+	void SetupSampler(const Ngs2WaveformFormat& format) {
+		const bool deferred = format.waveform_type == 0 && format.num_channels == 0 &&
+		                      format.sample_rate == 0 && format.config_data == 0 &&
+		                      format.frame_margin == 0 && format.frame_offset == 0;
+		EXIT_NOT_IMPLEMENTED(!deferred &&
+		                     (format.frame_margin != 0 || format.frame_offset != 0 ||
+		                      format.sample_rate == 0 || format.num_channels == 0));
+		ResetSetupState();
+		channels           = format.num_channels;
+		sample_rate        = format.sample_rate;
+		sample_phase       = 0;
+		sample_step        = uint64_t(sample_rate) << 32u;
+		decoded_samples    = 0;
+		decoded_bytes      = 0;
+		duration_remaining = 0;
+		skip_remaining     = 0;
+		waveform_end       = nullptr;
+		blocks.clear();
 		decoder.reset();
 		decoded_frame.clear();
+		next_decoded_frame.clear();
+		compressed_input.clear();
+		frame_cursor       = 0;
+		frame_samples      = 0;
+		next_frame_samples = 0;
 		accepts_blocks = true;
+		if (deferred) {
+			return;
+		}
 		if (format.waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
 			decoder = std::make_unique<Ajm::AjmAt9Decoder>(channels, format.sample_rate,
 			                                               Ajm::AjmSampleEncoding::Float, 0);
@@ -594,6 +619,7 @@ struct Ngs2VoiceInternal {
 			decoder->WriteCodecInfo(&info, sizeof(info), result);
 			EXIT_NOT_IMPLEMENTED(info.frame_samples > std::numeric_limits<uint16_t>::max());
 			decoded_frame.resize(info.frame_samples * channels);
+			compressed_input.reserve(info.super_frame_size);
 		} else {
 			EXIT_NOT_IMPLEMENTED(format.waveform_type != 0x12);
 		}
@@ -652,6 +678,13 @@ struct Ngs2VoiceEventParam {
 	Ngs2VoiceParamHeader header;
 	uint32_t             event_id;
 };
+
+struct Ngs2SubmixerVoiceSetupParam {
+	Ngs2VoiceParamHeader header;
+	uint32_t             num_io_channels;
+	uint32_t             flags;
+};
+static_assert(sizeof(Ngs2SubmixerVoiceSetupParam) == 16);
 
 struct Ngs2VoicePatchParam {
 	Ngs2VoiceParamHeader header;
@@ -749,6 +782,8 @@ static_assert(sizeof(Ngs2CustomMasteringVoiceState) == 16);
 static_assert(sizeof(Ngs2SamplerVoiceState) == 56);
 static_assert(sizeof(Ngs2CustomSamplerVoiceState) == 48);
 static_assert(sizeof(Ngs2WaveformFormat) == 24);
+static_assert(offsetof(Ngs2WaveformFormat, frame_offset) == 16 &&
+              offsetof(Ngs2WaveformFormat, frame_margin) == 20);
 static_assert(sizeof(Ngs2WaveformBlock) == 40);
 static_assert(sizeof(Ngs2WaveformInfo) == 232);
 
@@ -1383,10 +1418,12 @@ struct Ngs2VoiceCallbackInfo {
 	uint32_t    flag, reserved;
 	uintptr_t   user;
 	const void* block_data;
-	size_t      size;
-	uint32_t    repeats, attributes;
+	uint32_t    size, repeats, attributes, reserved2;
 };
 static_assert(sizeof(Ngs2VoiceCallbackInfo) == 56);
+static_assert(offsetof(Ngs2VoiceCallbackInfo, size) == 40 &&
+              offsetof(Ngs2VoiceCallbackInfo, repeats) == 44 &&
+              offsetof(Ngs2VoiceCallbackInfo, attributes) == 48);
 
 static void Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	auto&      block   = voice.blocks.front();
@@ -1405,8 +1442,9 @@ static void Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	                                  0,
 	                                  block.info.user_data,
 	                                  block.data,
-	                                  block.info.data_size,
+	                                  static_cast<uint32_t>(block.info.data_size),
 	                                  block.repeated_count,
+	                                  0,
 	                                  0};
 	if (!repeat) {
 		voice.blocks.pop_front();
@@ -1439,9 +1477,123 @@ static void Ngs2AdvancePcm(Ngs2VoiceInternal& voice) {
 	}
 }
 
+static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
+                            uint32_t& frame_samples) {
+	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
+		auto& block = voice.blocks.front();
+		if (block.info.num_samples != 0 && block.data_cursor == 0) {
+			voice.duration_remaining = block.info.num_samples;
+			voice.skip_remaining     = block.info.num_skip_samples;
+		}
+		if (voice.duration_remaining == 0) {
+			Ngs2FinishBlock(voice);
+			continue;
+		}
+		const auto skip =
+		    std::min(voice.skip_remaining,
+		             static_cast<uint32_t>(frame.size() / voice.channels));
+		Ajm::AjmGaplessState gapless;
+		gapless.Set({voice.duration_remaining, static_cast<uint16_t>(skip), 0}, true);
+		if (!voice.compressed_input.empty()) {
+			Ajm::AjmSidebandDecAt9CodecInfo info {};
+			voice.decoder->WriteCodecInfo(&info, sizeof(info), {});
+			EXIT_NOT_IMPLEMENTED(info.next_frame_size < voice.compressed_input.size());
+			const auto bytes =
+			    std::min<size_t>(info.next_frame_size - voice.compressed_input.size(),
+			                     block.info.data_size - block.data_cursor);
+			voice.compressed_input.insert(voice.compressed_input.end(),
+			                              block.data + block.data_cursor,
+			                              block.data + block.data_cursor + bytes);
+			block.data_cursor += bytes;
+			voice.decoded_bytes += bytes;
+			if (voice.compressed_input.size() < info.next_frame_size) {
+				Ngs2FinishBlock(voice);
+				continue;
+			}
+		}
+		const bool pending = !voice.compressed_input.empty();
+		const auto result  = voice.decoder->Decode(
+		    pending ? voice.compressed_input.data() : block.data + block.data_cursor,
+		    pending ? voice.compressed_input.size() : block.info.data_size - block.data_cursor,
+		    frame.data(), frame.size() * sizeof(float), false,
+		    &gapless);
+		if (!pending && result.result == Ajm::AJM_RESULT_PARTIAL_INPUT &&
+		    result.input_consumed == 0) {
+			voice.compressed_input.insert(voice.compressed_input.end(),
+			                              block.data + block.data_cursor,
+			                              block.data + block.info.data_size);
+			voice.decoded_bytes += block.info.data_size - block.data_cursor;
+			block.data_cursor = block.info.data_size;
+			Ngs2FinishBlock(voice);
+			continue;
+		}
+		EXIT_NOT_IMPLEMENTED(result.result != OK || result.input_consumed == 0);
+		if (pending) {
+			voice.compressed_input.erase(voice.compressed_input.begin(),
+			                             voice.compressed_input.begin() + result.input_consumed);
+		} else {
+			block.data_cursor += result.input_consumed;
+			voice.decoded_bytes += result.input_consumed;
+		}
+		voice.skip_remaining -= skip - gapless.current.skip_samples;
+		const auto decoded_samples =
+		    static_cast<uint32_t>(result.output_written / (sizeof(float) * voice.channels));
+		if (decoded_samples != 0) {
+			EXIT_NOT_IMPLEMENTED(decoded_samples > voice.duration_remaining);
+			frame_samples = decoded_samples;
+			voice.duration_remaining -= decoded_samples;
+		}
+		if (voice.duration_remaining == 0 ||
+		    (block.data_cursor == block.info.data_size && voice.compressed_input.empty())) {
+			if (voice.duration_remaining == 0) {
+				voice.compressed_input.clear();
+			}
+			Ngs2FinishBlock(voice);
+		}
+		if (decoded_samples != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool Ngs2CurrentAtracFrame(Ngs2VoiceInternal& voice) {
+	if (voice.frame_cursor == voice.frame_samples) {
+		if (voice.next_frame_samples != 0) {
+			std::swap(voice.decoded_frame, voice.next_decoded_frame);
+			voice.frame_samples      = voice.next_frame_samples;
+			voice.next_frame_samples = 0;
+		} else if (!Ngs2DecodeFrame(voice, voice.decoded_frame, voice.frame_samples)) {
+			return false;
+		}
+		voice.frame_cursor = 0;
+	}
+	return voice.state == Ngs2VoicePlayState::Playing &&
+	       voice.frame_cursor < voice.frame_samples;
+}
+
+static void Ngs2AdvanceAtrac9(Ngs2VoiceInternal& voice) {
+	const auto output_rate = uint64_t(voice.rack->ngs->option.sample_rate) << 32u;
+	while (voice.state == Ngs2VoicePlayState::Playing && voice.sample_phase >= output_rate) {
+		if (!Ngs2CurrentAtracFrame(voice)) {
+			break;
+		}
+		++voice.frame_cursor;
+		++voice.decoded_samples;
+		voice.sample_phase -= output_rate;
+	}
+	if (voice.blocks.empty() && voice.frame_cursor == voice.frame_samples &&
+	    voice.next_frame_samples == 0 && !voice.accepts_blocks) {
+		voice.sample_phase = 0;
+	}
+}
+
 static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	uint32_t output = 0;
-	while (voice.state == Ngs2VoicePlayState::Playing && output < grain && !voice.blocks.empty()) {
+	const auto output_rate = uint64_t(voice.rack->ngs->option.sample_rate) << 32u;
+	while (voice.state == Ngs2VoicePlayState::Playing && output < grain &&
+	       (!voice.blocks.empty() || voice.frame_cursor < voice.frame_samples ||
+	        voice.next_frame_samples != 0)) {
 		if (voice.decoder == nullptr) {
 			Ngs2AdvancePcm(voice);
 			if (voice.state != Ngs2VoicePlayState::Playing || voice.blocks.empty()) {
@@ -1461,8 +1613,7 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 				       next_block.info.num_skip_samples * voice.channels;
 			}
 			const float fraction = static_cast<float>(voice.sample_phase) /
-			                       static_cast<float>(uint64_t(voice.rack->ngs->option.sample_rate)
-			                                          << 32u);
+			                       static_cast<float>(output_rate);
 			for (uint32_t c = 0; c < voice.channels; ++c) {
 				voice.samples[c * grain + output] =
 				    std::lerp(static_cast<float>(pcm[c]), static_cast<float>(next[c]), fraction) /
@@ -1472,44 +1623,39 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 			++output;
 			continue;
 		}
-		auto&          block   = voice.blocks.front();
-		auto           count   = std::min(grain - output, block.info.num_samples - block.cursor);
-		const auto skip =
-		    std::min(block.skip_remaining,
-		             static_cast<uint32_t>(voice.decoded_frame.size() / voice.channels));
-		Ajm::AjmGaplessState gapless;
-		gapless.Set({block.info.num_samples - block.cursor, static_cast<uint16_t>(skip), 0},
-		            true);
-		const auto result = voice.decoder->Decode(
-		    block.data + block.data_cursor, block.info.data_size - block.data_cursor,
-		    voice.decoded_frame.data(), voice.decoded_frame.size() * sizeof(float), false,
-		    &gapless);
-		EXIT_NOT_IMPLEMENTED(result.result != OK || result.input_consumed == 0);
-		block.data_cursor += result.input_consumed;
-		block.skip_remaining -= skip - gapless.current.skip_samples;
-		const auto decoded_samples =
-		    static_cast<uint32_t>(result.output_written / (sizeof(float) * voice.channels));
-		if (decoded_samples == 0) {
-			continue;
+		Ngs2AdvanceAtrac9(voice);
+		if (!Ngs2CurrentAtracFrame(voice)) {
+			break;
 		}
-		EXIT_NOT_IMPLEMENTED(decoded_samples > count);
-		count = decoded_samples;
-		for (uint32_t c = 0; c < voice.channels; ++c) {
-			for (uint32_t i = 0; i < count; ++i) {
-				const auto index = i * voice.channels + c;
-				voice.samples[c * grain + output + i] = voice.decoded_frame[index];
+		if (voice.frame_cursor + 1 == voice.frame_samples && voice.sample_phase != 0) {
+			if (voice.next_frame_samples == 0 && !voice.blocks.empty()) {
+				if (voice.next_decoded_frame.empty()) {
+					voice.next_decoded_frame.resize(voice.decoded_frame.size());
+				}
+				Ngs2DecodeFrame(voice, voice.next_decoded_frame, voice.next_frame_samples);
+			}
+			if (voice.state != Ngs2VoicePlayState::Playing ||
+			    voice.frame_cursor >= voice.frame_samples) {
+				break;
 			}
 		}
-		output += count;
-		block.cursor += count;
-		voice.decoded_samples += count;
-		if (block.cursor == block.info.num_samples) {
-			voice.decoded_bytes += block.info.data_size;
-			Ngs2FinishBlock(voice);
+		const float* current = voice.decoded_frame.data() + voice.frame_cursor * voice.channels;
+		const float* next = voice.frame_cursor + 1 < voice.frame_samples
+		                        ? current + voice.channels
+		                        : voice.next_frame_samples != 0 ? voice.next_decoded_frame.data()
+		                                                        : current;
+		const float fraction = static_cast<float>(voice.sample_phase) /
+		                       static_cast<float>(output_rate);
+		for (uint32_t c = 0; c < voice.channels; ++c) {
+			voice.samples[c * grain + output] = std::lerp(current[c], next[c], fraction);
 		}
+		voice.sample_phase += voice.sample_step;
+		++output;
 	}
 	if (voice.decoder == nullptr) {
 		Ngs2AdvancePcm(voice);
+	} else {
+		Ngs2AdvanceAtrac9(voice);
 	}
 	voice.has_samples = output != 0;
 }
@@ -1517,6 +1663,11 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
+		return;
+	}
+	if (voice.channels == 0) {
+		voice.has_samples = false;
+		voice.rendered    = true;
 		return;
 	}
 	EXIT_NOT_IMPLEMENTED(voice.rendering);
@@ -1535,6 +1686,8 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				}
 			}
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
+			    voice.frame_cursor == voice.frame_samples &&
+			    voice.next_frame_samples == 0 &&
 			    !voice.accepts_blocks &&
 			    std::ranges::none_of(voice.filters,
 			                         [](const auto& filter) { return filter.HasHistory(); })) {
@@ -1552,12 +1705,16 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				}
 				EXIT_NOT_IMPLEMENTED(port.input != 0);
 				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
-				for (uint32_t dst = 0; dst < voice.channels; ++dst) {
+				const size_t output_channels =
+				    matrix == nullptr
+				        ? voice.channels
+				        : std::min<size_t>(voice.channels, matrix->size() / source->channels);
+				for (size_t dst = 0; dst < output_channels; ++dst) {
 					for (uint32_t src = 0; src < source->channels; ++src) {
 						const float level =
 						    port.volume * (matrix == nullptr
 						                       ? (src == dst ? 1.0f : 0.0f)
-						                       : matrix->at(dst * source->channels + src));
+						                       : (*matrix)[dst * source->channels + src]);
 						for (uint32_t i = 0; i < grain; ++i) {
 							voice.samples[dst * grain + i] +=
 							    source->samples[src * grain + i] * level;
@@ -1612,6 +1769,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
 	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
 	Common::LockGuard lock(ngs->mutex);
+	std::vector<std::vector<float>> output_mix(num_buffer_info);
 	std::vector<Ngs2VoiceInternal*> voices;
 	{
 		Common::LockGuard racks_lock(g_racks_mutex);
@@ -1633,9 +1791,6 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	}
 	const auto grain = ngs->option.num_grain_samples;
 	for (auto* voice: voices) {
-		if (voice->channels == 0) {
-			continue;
-		}
 		Ngs2RenderVoice(*voice, voices, grain);
 		if (voice->rack->type != Ngs2RackType::Mastering || !voice->has_samples) {
 			continue;
@@ -1643,10 +1798,21 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
 		const auto& output = buffer_info[voice->output_id];
 		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
-		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x18 ||
+		EXIT_NOT_IMPLEMENTED((output.waveform_type != 0x12 && output.waveform_type != 0x18) ||
 		                     output.num_channels != voice->channels);
-		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels * sizeof(float));
-		auto* pcm = static_cast<float*>(output.buffer);
+		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
+		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
+		                                                                             : sizeof(float)));
+		float* pcm = nullptr;
+		if (output.waveform_type == 0x12) {
+			auto& mix = output_mix[voice->output_id];
+			if (mix.empty()) {
+				mix.resize(grain * output.num_channels);
+			}
+			pcm = mix.data();
+		} else {
+			pcm = static_cast<float*>(output.buffer);
+		}
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
 			for (uint32_t src = 0; src < voice->channels; ++src) {
 				const float level = voice->output_matrix.empty()
@@ -1656,6 +1822,18 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 					pcm[i * output.num_channels + dst] += voice->samples[src * grain + i] * level;
 				}
 			}
+		}
+	}
+	for (uint32_t i = 0; i < num_buffer_info; ++i) {
+		const auto& mix = output_mix[i];
+		if (mix.empty()) {
+			continue;
+		}
+		auto* pcm = static_cast<int16_t*>(buffer_info[i].buffer);
+		for (size_t sample = 0; sample < mix.size(); ++sample) {
+			pcm[sample] = static_cast<int16_t>(std::clamp(
+			    std::lrintf(std::clamp(mix[sample], -1.0f, 1.0f) * 32768.0f), -32768l,
+			    32767l));
 		}
 	}
 	for (auto* voice: voices) {
@@ -1682,6 +1860,23 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 	return std::memcmp(data, four_cc, 4) == 0;
 }
 
+static bool Ngs2GetAtrac9CodecInfo(std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config,
+                                   Atrac9CodecInfo& codec) {
+	if (config[0] != 0xfe || (config[1] & 1u) != 0 || ((config[1] >> 1u) & 7u) >= 6u) {
+		return false;
+	}
+	void* decoder = Atrac9GetHandle();
+	const bool valid = decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
+	                   Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
+	                   codec.samplingRate > 0 && codec.superframeSize > 0 &&
+	                   codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
+	                   codec.superframeSize % codec.framesInSuperframe == 0;
+	if (decoder != nullptr) {
+		Atrac9ReleaseHandle(decoder);
+	}
+	return valid;
+}
+
 static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformInfo* info) {
 	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36,
 	                                            0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65,
@@ -1695,7 +1890,7 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	}
 
 	const uint64_t riff_end64 = 8ull + Ngs2ReadLe32(bytes + 4);
-	if (riff_end64 < 12 || riff_end64 > data_size) {
+	if (riff_end64 < 12) {
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
 	const auto riff_end = static_cast<size_t>(riff_end64);
@@ -1705,11 +1900,13 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	size_t         waveform_offset  = 0;
 	uint32_t       waveform_size    = 0;
 
-	for (size_t offset = 12; offset + 8 <= riff_end;) {
+	for (size_t offset = 12; offset + 8 <= std::min(riff_end, data_size);) {
 		const auto* chunk       = bytes + offset;
 		const auto  chunk_size  = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
 		const auto  payload     = offset + 8;
-		if (chunk_size > riff_end - payload) {
+		const auto  is_data     = Ngs2FourCcEquals(chunk, "data");
+		const uint64_t next    = static_cast<uint64_t>(payload) + chunk_size + (chunk_size & 1u);
+		if (next > riff_end || (next > data_size && !is_data)) {
 			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 		}
 
@@ -1723,7 +1920,7 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 				return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 			}
 			fact = bytes + payload;
-		} else if (Ngs2FourCcEquals(chunk, "data")) {
+		} else if (is_data) {
 			if (payload > std::numeric_limits<uint32_t>::max()) {
 				return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 			}
@@ -1731,9 +1928,8 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 			waveform_size   = static_cast<uint32_t>(chunk_size);
 		}
 
-		const uint64_t next = static_cast<uint64_t>(payload) + chunk_size + (chunk_size & 1u);
-		if (next > riff_end) {
-			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+		if (next > data_size) {
+			break;
 		}
 		offset = static_cast<size_t>(next);
 	}
@@ -1748,20 +1944,8 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 
 	std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config {};
 	std::memcpy(config.data(), format + 44, config.size());
-	if (config[0] != 0xfe || (config[1] & 1u) != 0 || ((config[1] >> 1u) & 7u) >= 6u) {
-		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
-	}
-
 	Atrac9CodecInfo codec {};
-	void*           decoder = Atrac9GetHandle();
-	const bool valid_codec =
-	    decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
-	    Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
-	    codec.samplingRate > 0 && codec.superframeSize > 0 && codec.framesInSuperframe > 0 &&
-	    codec.frameSamples > 0 && codec.superframeSize % codec.framesInSuperframe == 0;
-	if (decoder != nullptr) {
-		Atrac9ReleaseHandle(decoder);
-	}
+	const bool valid_codec = Ngs2GetAtrac9CodecInfo(config, codec);
 	const uint64_t frame_samples =
 	    static_cast<uint64_t>(codec.frameSamples) * static_cast<uint64_t>(codec.framesInSuperframe);
 	if (!valid_codec || codec.channels != Ngs2ReadLe16(format + 2) ||
@@ -1819,6 +2003,32 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	EXIT_NOT_IMPLEMENTED(block == nullptr);
 
 	std::memset(block, 0, sizeof(Ngs2WaveformBlock));
+	if (format == nullptr || format->num_channels == 0 || format->num_channels > 8 ||
+	    format->sample_rate == 0 || format->sample_rate > 192000) {
+		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+	}
+	if (format->waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
+		std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config {
+		    static_cast<uint8_t>(format->config_data >> 24u),
+		    static_cast<uint8_t>(format->config_data >> 16u),
+		    static_cast<uint8_t>(format->config_data >> 8u),
+		    static_cast<uint8_t>(format->config_data)};
+		Atrac9CodecInfo codec {};
+		if (!Ngs2GetAtrac9CodecInfo(config, codec) ||
+		    codec.channels != format->num_channels || codec.samplingRate != format->sample_rate) {
+			return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+		}
+		const uint64_t frame_samples = uint64_t(codec.frameSamples) * codec.framesInSuperframe;
+		const uint64_t skip          = sample_pos % frame_samples;
+		block->data_offset = uint64_t(sample_pos / frame_samples) * codec.superframeSize;
+		block->data_size = num_samples == 0
+		                       ? 0
+		                       : ((skip + num_samples + frame_samples - 1) / frame_samples) *
+		                             codec.superframeSize;
+		block->num_skip_samples = num_samples == 0 ? 0 : static_cast<uint32_t>(skip);
+	} else {
+		return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+	}
 	block->num_samples = num_samples;
 	return OK;
 }
@@ -2076,7 +2286,21 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				}
 				break;
 			}
-			case 0x2000: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Submixer); break;
+			case 0x2000: {
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Submixer);
+				if ((param->id & 0xffffu) == 0) {
+					EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2SubmixerVoiceSetupParam));
+					const auto& setup =
+					    *reinterpret_cast<const Ngs2SubmixerVoiceSetupParam*>(param);
+					EXIT_NOT_IMPLEMENTED(
+					    setup.num_io_channels == 0 ||
+					    setup.num_io_channels > voice->rack->option.submixer.max_channels ||
+					    setup.flags != 0);
+					voice->ResetSetupState();
+					voice->channels = setup.num_io_channels;
+				}
+				break;
+			}
 			case 0x2001: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Reverb); break;
 			case 0x3000: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Mastering);
@@ -2145,18 +2369,32 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						};
 						const auto& blocks = *reinterpret_cast<const BlocksParam*>(param);
 						EXIT_NOT_IMPLEMENTED(!voice->accepts_blocks ||
-						                     (blocks.flags != 0 && blocks.flags != 1 &&
-						                      blocks.flags != 0x11 &&
-						                      blocks.flags != 0x4));
-						if (blocks.flags == 0x4) {
+						                     (blocks.flags & ~0x17u) != 0);
+						if ((blocks.flags & 0x4u) != 0) {
 							voice->blocks.clear();
-							voice->sample_phase = 0;
-							voice->waveform_end = nullptr;
+							voice->sample_phase       = 0;
+							voice->duration_remaining = 0;
+							voice->skip_remaining     = 0;
+							voice->compressed_input.clear();
+							voice->frame_cursor       = 0;
+							voice->frame_samples      = 0;
+							voice->next_frame_samples = 0;
+							voice->waveform_end  = nullptr;
 						}
 						voice->accepts_blocks = (blocks.flags & 1u) != 0;
+						const bool only_data  = (blocks.flags & 2u) != 0;
+						EXIT_NOT_IMPLEMENTED(only_data && voice->decoder == nullptr);
 						for (uint32_t i = 0; i < blocks.count; ++i) {
-							const auto& block = blocks.blocks[i];
-							EXIT_NOT_IMPLEMENTED(block.num_samples == 0);
+							auto block = blocks.blocks[i];
+							if (!only_data && block.num_samples == 0 && block.data_size == 0) {
+								continue;
+							}
+							EXIT_NOT_IMPLEMENTED(!only_data && block.num_samples == 0);
+							if (only_data) {
+								block.num_repeats      = 0;
+								block.num_skip_samples = 0;
+								block.num_samples      = 0;
+							}
 							EXIT_NOT_IMPLEMENTED(block.num_repeats != 0 &&
 							                     (voice->rack->type != Ngs2RackType::Sampler ||
 							                      voice->decoder != nullptr));
@@ -2179,12 +2417,12 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						}
 						break;
 					}
-					case 5: {
-						const float ratio = *reinterpret_cast<const float*>(param + 1);
-						EXIT_NOT_IMPLEMENTED(!std::isfinite(ratio) || ratio < 0.0f || ratio > 4.0f ||
-						                     (voice->decoder != nullptr && ratio != 1.0f));
+						case 5: {
+							const float ratio = *reinterpret_cast<const float*>(param + 1);
+						EXIT_NOT_IMPLEMENTED(!std::isfinite(ratio));
+						const float clamped_ratio = std::clamp(ratio, 0.0f, 4.0f);
 						voice->sample_step = static_cast<uint64_t>(std::llround(
-						    static_cast<double>(voice->sample_rate) * ratio * 4294967296.0));
+							    static_cast<double>(voice->sample_rate) * clamped_ratio * 4294967296.0));
 						break;
 					}
 					case 0xa: {
