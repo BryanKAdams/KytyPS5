@@ -158,18 +158,24 @@ window-title frame rate after a 20 s settle, with the scene checked at the start
 | + eager readback of hot pages | 34.4 / 34.4 | 61% |
 | + queue thread for submits | 39.1 / 39.2 | 62% |
 | + shader hash cached per registration | 40.4 / 40.3 | 62% |
+| + clean reads on protected pages (A/B 39.8 -> 42.2) | 42.2 (mean of runs) | - |
 
 Eager readback removed the 21 ms per frame of guest waits and cut readback traffic from about
 23 MiB to under 1 MiB per 5 s. The frame rate did not move, because Thread_Gpu, not the guest
 thread, bounded the frame.
 
-With the queue thread, Thread_Gpu still stalls on two read faults per frame:
-- **About 3.8 ms:** hashing shader code in `GetShaderParams`. One shader is registered again
-  every frame, so it is rehashed every frame, and its code bytes are marked GPU-written.
-  Reading them from the backing when clean did not avoid the fault. The likely cause is a
-  writable buffer binding whose range covers the code, and the write history rotates too fast
-  to name it.
-- **About 2.8 ms:** a mesh-emulated indirect draw reading arguments that a compute dispatch
+**Clean reads on protected pages:** once a frame, Thread_Gpu stalled about 4 ms reading one of
+Astro Bot's vertex-attribute tables, in `ShaderApplyAttribSemantics` and again in the SRT
+walker. ThinLTO folding made the symbolizer blame `GetShaderParams`, and the disassembly showed
+the real site. The table is not GPU-written. It shares a 4 KiB tracker page with GPU-written
+data, so the whole page is protected. Game-thread write faults nearby download a 512 KiB window
+that also arms the page. The buffer cache now tracks the exact bytes of downloads still in
+flight. Thread_Gpu's own table reads peek at the page's GPU-dirty bit without a lock, and on a
+dirty page they read clean bytes from the backing instead of faulting. In alternating A/B runs
+(two 45 s rounds each), this took the overworld from 39.8 to 42.2 fps.
+
+Thread_Gpu still stalls on one read fault per frame:
+- **About 4.7 ms:** a mesh-emulated indirect draw reading arguments that a compute dispatch
   wrote earlier in the frame. All of Astro Bot's indirect draws with GPU-written arguments are
   mesh-emulated, so a plain `vkCmdDrawIndexedIndirect` path would not remove this drain.
   Downloading the arguments eagerly and submitting right away only turned the drain into an
