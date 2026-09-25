@@ -9186,6 +9186,17 @@ public:
                     std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
                 "a repeated metadata fill did not clear an already drawn target");
         paint();
+        auto sampled_desc = color.desc;
+        sampled_desc.type = BindingType::Texture;
+        sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto sampled_id = texture_cache.FindImage(sampled_desc);
+        Require(name, "sampled lookup after a GPU check",
+                sampled_id == color.image_id &&
+                    (!gpu_path || resources.GetBufferCache().IsRegionGpuModified(
+                                      dcc_address, metadata_size.size)) &&
+                    ReadCachedTexel(name, context, color.image_id) == painted,
+                "sampling a GPU-checked target read its keys back or reapplied a consumed clear");
+        paint();
         WriteMetadata(context, dcc_address, metadata_size.size, UINT32_MAX);
         fill_metadata(metadata_words - 1);
         bind();

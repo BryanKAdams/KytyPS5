@@ -1271,12 +1271,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
                                             uint64_t slices_address, uint64_t slice_size,
                                             uint32_t image_first, uint32_t count) {
-	// Render targets only: their keys are always consumed, so each GPU write is checked once.
-	const auto& view = desc.view_info;
-	if (!m_dcc_gpu_clear || desc.type != BindingType::RenderTarget || desc.info.IsVolume() ||
-	    count == 0 || count > DccClearResolver::MaxSlices || view.base_level != 0 ||
-	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
-	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+	if (!m_dcc_gpu_clear || count == 0) {
 		return false;
 	}
 	std::array<vk::ClearColorValue, DccClearResolver::CodeCount> colors {};
@@ -1290,6 +1285,19 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 		// No key clears this view, so the metadata bytes cannot change the image.
 		return true;
 	}
+	// A GPU check consumed every clear it found, and no GPU write has touched the slices since,
+	// so any binding type (textures, storage, video out) would find no clear to apply either.
+	if (DccSlicesChecked(slices_address, slice_size, count, code_mask)) {
+		return true;
+	}
+	// Render targets only: their keys are always consumed, so each GPU write is checked once.
+	const auto& view = desc.view_info;
+	if (desc.type != BindingType::RenderTarget || desc.info.IsVolume() ||
+	    count > DccClearResolver::MaxSlices || view.base_level != 0 ||
+	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+		return false;
+	}
 	{
 		std::scoped_lock lock {m_lock};
 		const auto&      image = m_slot_images[id];
@@ -1298,9 +1306,6 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 		    image_first >= image.backing.layers || count > image.backing.layers - image_first) {
 			return false;
 		}
-	}
-	if (DccSlicesChecked(slices_address, slice_size, count, code_mask)) {
-		return true;
 	}
 	m_dcc_gpu_checks++;
 	{
