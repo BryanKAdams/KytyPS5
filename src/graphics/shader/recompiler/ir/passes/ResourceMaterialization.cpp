@@ -1171,10 +1171,10 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 		}
 	}
 	snapshot.images.resize(program.info.images.size());
-	specialization.images.clear();
-	specialization.images.reserve(program.info.images.size());
-	for (const auto& image: program.info.images) {
-		specialization.images.push_back({
+	specialization.images.resize(program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image = program.info.images[i];
+		specialization.images[i] = {
 		    .numeric_class = image.numeric_class,
 		    .dimension = image.dimension,
 		    .mip_count = image.mip_count,
@@ -1184,10 +1184,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 		    .indirect_mapping_offset = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
 		    .cube = image.cube,
-		});
-	}
-	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-		const auto& image = program.info.images[i];
+		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
 			return false;
