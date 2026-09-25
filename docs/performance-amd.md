@@ -178,6 +178,7 @@ window-title frame rate after a 20 s settle, with the scene checked at the start
 | + shader hash cached per registration | 40.4 / 40.3 | 62% |
 | + clean reads on protected pages (A/B 39.8 -> 42.2) | 42.2 (mean of runs) | - |
 | + GPU-built mesh indirect draws (same binary, flag off -> on) | 42.2 -> 51.4 | - |
+| + batched RELEASE_MEM submits (A/B, interval 0 -> 2000 us) | 48.8 -> 57.9 | - |
 
 Eager readback removed the 21 ms per frame of guest waits and cut readback traffic from about
 23 MiB to under 1 MiB per 5 s. The frame rate did not move, because Thread_Gpu, not the guest
@@ -210,6 +211,23 @@ overworld runs at 42.2 fps with `--gpu-mesh-indirect false` and 51.4 fps with it
 A/B, two 45 s rounds each: 41.3 / 51.2 and 43.1 / 51.6).
 Full-resolution screenshots of both match, and drain stats show no full drains on Thread_Gpu.
 
+**Batched RELEASE_MEM submits:** with Thread_Gpu no longer stalling, the overworld held at about
+51 fps, and no thread was saturated. GPU timestamps (`--drain-stats` now reports GPU busy time and
+gaps) showed 11.8 ms of GPU work and 8.4 ms of gaps in each 20 ms frame, spread over about 340
+command buffers. Almost all of them came from RELEASE_MEM packets carrying an interrupt, which
+submitted every time. The queue thread spent 16 ms a frame in `vkQueueSubmit`, and the GPU
+waited between tiny buffers. The game loads a compute-written float every frame (it does
+`vmovss xmm0, [r8]` and stores the value into its state; it is not a fence), so late GPU work
+bounded the frame. RELEASE_MEM submits now wait at least `--label-flush-interval-us` (default
+2000) since the last submit; the end of every submission slice still submits. Alternating A/B
+runs gave 48.8 fps at 0 and 57.9 fps at 2000 us. Nearby values were 1500 us: 56.5 and
+2500 us: 57.2, while 5000 us fell to 43.5 because the game waits on the delayed interrupts.
+Submits drop to about 20 a frame, and GPU gaps to about 0.6 ms. Three other experiments did not
+move the frame rate, which stayed near 51 fps:
+- `--gpu-frames-ahead` (opt-in): the suspend point waits only for an earlier frame's work.
+- A 100 Hz virtual vblank.
+- Merging the SRT materialization work.
+
 Reviewed but not ported: #506 (its texture-residency change would raise memory to the pressure
 threshold, where eviction drains the GPU; read-only compute barriers almost never apply; block
 descriptor reads are already in `main`), #767 (duplicates #702 and the dense memo), #628, #484,
@@ -222,6 +240,8 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 --async-submit false          Submit on the GPU thread (the previous behavior).
 --gpu-mesh-indirect true      Default: build mesh-emulated GPU-args indirect draws on the GPU.
 --gpu-mesh-indirect false     Read the arguments on the CPU (the previous behavior).
+--label-flush-interval-us N   Default 2000: minimum microseconds between RELEASE_MEM submits (0 = previous).
+--gpu-frames-ahead N          Default 0: frames the game may build ahead of Thread_Gpu at suspend points.
 --bda-sync Selective          Default: use dirty-region discovery, with conservative fallback.
 --bda-sync Legacy             Use the full mapped-buffer walk for controlled comparisons.
 --bda-sync SelectiveChecked   Use selective discovery and check remaining dirty-page coverage.
