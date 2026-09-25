@@ -297,6 +297,10 @@ struct ShaderMappedData {
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	// Set by the shader map: the registration this entry belongs to, and the code hash cached
+	// on first use (0 until then).
+	uint64_t        generation          = 0;
+	uint64_t        hash                = 0;
 };
 
 void ShaderInit();
