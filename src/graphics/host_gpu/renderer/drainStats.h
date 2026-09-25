@@ -43,6 +43,8 @@ enum class Kind : uint8_t {
 	DccMetaWrite,  // A GPU write covered known DCC metadata; the value is its size in bytes.
 	DccCheck,      // A DCC lookup read GPU-written metadata; the value is slices it cleared.
 	DccGpuCheck,   // A DCC lookup checked GPU-written metadata on the GPU; the value is slices.
+	Submit,        // vkQueueSubmit, including the wait for the queue lock; the value is ns.
+	QueueLockWait, // Time a submit waited for the queue lock (held by present or another submit).
 	Count,
 };
 
@@ -53,6 +55,8 @@ constexpr uint32_t NoPm4Op    = Pm4OpCount;
 inline std::atomic_bool         g_enabled {false};
 inline thread_local Reason      t_reason = Reason::Unattributed;
 inline thread_local uint32_t    t_pm4_op = NoPm4Op;
+// Guest instruction that raised the page fault being handled on this thread.
+inline thread_local uint64_t    t_fault_pc = 0;
 
 [[nodiscard]] inline bool Enabled() noexcept {
 	return g_enabled.load(std::memory_order_relaxed);
@@ -64,6 +68,8 @@ void Stop();
 
 void Record(Kind kind, Reason reason, uint32_t pm4_op, uint64_t value) noexcept;
 void CountFrame(bool new_frame) noexcept;
+// A GPU-memory fault stalled the faulting thread for `ns`; keyed by the faulting instruction.
+void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noexcept;
 
 inline void Record(Kind kind, uint64_t value) noexcept {
 	if (Enabled()) {

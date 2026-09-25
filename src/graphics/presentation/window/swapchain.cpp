@@ -698,7 +698,9 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		DrainStats::ReasonScope reason(DrainStats::Reason::PresentFrame);
+		DrainStats::WaitTimer   held(DrainStats::Kind::Submit);
+		Common::LockGuard       lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {

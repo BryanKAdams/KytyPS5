@@ -369,8 +369,19 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	const bool stats        = DrainStats::Enabled();
+	const auto submit_start = stats ? std::chrono::steady_clock::now()
+	                                : std::chrono::steady_clock::time_point {};
+	const auto elapsed_ns   = [&submit_start] {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now() - submit_start)
+		                                 .count());
+	};
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
+		if (stats) {
+			DrainStats::Record(DrainStats::Kind::QueueLockWait, elapsed_ns());
+		}
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 
@@ -391,6 +402,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+	}
+	if (stats) {
+		DrainStats::Record(DrainStats::Kind::Submit, elapsed_ns());
 	}
 
 	if (result != vk::Result::eSuccess) {

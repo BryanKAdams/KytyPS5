@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/drainStats.h"
 
 #include "common/logging/log.h"
+#include "kernel/pthread.h"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::DrainStats {
@@ -37,6 +39,19 @@ Cell                  g_cells[CellCount];
 std::atomic<uint64_t> g_frames {0};
 std::atomic<uint64_t> g_presents {0};
 
+struct FaultSite {
+	std::string thread;
+	uint64_t    count        = 0;
+	uint64_t    ns           = 0;
+	uint64_t    last_address = 0;
+	bool        write        = false;
+};
+
+// Per-interval fault sites, keyed by faulting instruction and access. Faults that stall are
+// rare (a few per frame), so a mutex is cheap here.
+std::mutex                              g_site_mutex;
+std::unordered_map<uint64_t, FaultSite> g_sites;
+
 std::mutex                  g_reporter_mutex;
 std::condition_variable_any g_reporter_wake;
 std::jthread                g_reporter;
@@ -59,6 +74,8 @@ const char* KindName(Kind kind) {
 		case Kind::DccMetaWrite: return "dcc-meta-write";
 		case Kind::DccCheck: return "dcc-check";
 		case Kind::DccGpuCheck: return "dcc-gpu-check";
+		case Kind::Submit: return "submit";
+		case Kind::QueueLockWait: return "queue-lock-wait";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -154,6 +171,18 @@ struct Row {
 	uint64_t value;
 };
 
+bool IsTimeKind(Kind kind) {
+	switch (kind) {
+		case Kind::FullDrain:
+		case Kind::TickWait:
+		case Kind::PriorityWait:
+		case Kind::BlockedPoll:
+		case Kind::Submit:
+		case Kind::QueueLockWait: return true;
+		default: return false;
+	}
+}
+
 void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	const auto frames = after.frames - before.frames;
 	const auto per    = [frames](double value) { return frames == 0 ? 0.0 : value / frames; };
@@ -181,7 +210,8 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	std::string text = fmt::format(
 	    "drain-stats: {:.1f}s frames={} ({:.1f}/s) presents={}", seconds, frames,
 	    frames / seconds, after.presents - before.presents);
-	for (const auto kind: {Kind::FullDrain, Kind::TickWait, Kind::PriorityWait, Kind::BlockedPoll}) {
+	for (const auto kind: {Kind::FullDrain, Kind::TickWait, Kind::PriorityWait, Kind::BlockedPoll,
+	                       Kind::Submit, Kind::QueueLockWait}) {
 		const auto k  = static_cast<size_t>(kind);
 		const auto ms = static_cast<double>(kind_value[k]) / 1e6;
 		text += fmt::format(" | {} n={} {:.1f}ms ({:.2f}ms/frame)", KindName(kind), kind_count[k],
@@ -193,8 +223,8 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	                    kind_count[static_cast<size_t>(Kind::ReadbackClean)]);
 
 	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
-		const bool a_time = a.kind < Kind::Readback;
-		const bool b_time = b.kind < Kind::Readback;
+		const bool a_time = IsTimeKind(a.kind);
+		const bool b_time = IsTimeKind(b.kind);
 		if (a_time != b_time) {
 			return a_time;
 		}
@@ -202,10 +232,10 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	});
 	size_t printed = 0;
 	for (const auto& row: rows) {
-		if (printed++ == 24) {
+		if (printed++ == 32) {
 			break;
 		}
-		if (row.kind < Kind::Readback) {
+		if (IsTimeKind(row.kind)) {
 			const auto ms = static_cast<double>(row.value) / 1e6;
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}ms avg={:.3f}ms\n",
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
@@ -220,6 +250,30 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 			                    ReasonName(row.reason), OpName(row.op), row.count,
 			                    static_cast<double>(row.value) / (1024.0 * 1024.0));
 		}
+	}
+	std::unordered_map<uint64_t, FaultSite> sites;
+	{
+		std::lock_guard lock(g_site_mutex);
+		sites.swap(g_sites);
+	}
+	std::vector<const FaultSite*> site_rows;
+	std::vector<uint64_t>         site_keys;
+	for (const auto& [key, site]: sites) {
+		site_rows.push_back(&site);
+		site_keys.push_back(key);
+	}
+	std::vector<size_t> site_order(site_rows.size());
+	for (size_t i = 0; i < site_order.size(); i++) site_order[i] = i;
+	std::sort(site_order.begin(), site_order.end(),
+	          [&](size_t a, size_t b) { return site_rows[a]->ns > site_rows[b]->ns; });
+	for (size_t i = 0; i < std::min<size_t>(site_order.size(), 8); i++) {
+		const auto& site = *site_rows[site_order[i]];
+		const auto  pc   = site_keys[site_order[i]] & ~(uint64_t {1} << 63u);
+		const auto  ms   = static_cast<double>(site.ns) / 1e6;
+		text += fmt::format("  fault-site     {:<5} pc={:#014x} thread={:<24} n={:<6} {:8.2f}ms "
+		                    "avg={:.3f}ms addr={:#014x}\n",
+		                    site.write ? "write" : "read", pc, site.thread, site.count, ms,
+		                    ms / static_cast<double>(site.count), site.last_address);
 	}
 	Log::WriteToConsoleAndLog(text);
 }
@@ -275,6 +329,28 @@ void Record(Kind kind, Reason reason, uint32_t pm4_op, uint64_t value) noexcept 
 	auto& cell = g_cells[Index(kind, reason, pm4_op)];
 	cell.count.fetch_add(1, std::memory_order_relaxed);
 	cell.value.fetch_add(value, std::memory_order_relaxed);
+}
+
+void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	const auto key = (pc & ~(uint64_t {1} << 63u)) | (write ? uint64_t {1} << 63u : 0);
+	std::lock_guard lock(g_site_mutex);
+	auto&           site = g_sites[key];
+	if (site.count == 0) {
+		char name[64] = "(host thread)";
+		if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (LibKernel::PthreadGetname(self, name) != 0) {
+				std::snprintf(name, sizeof(name), "(unnamed guest)");
+			}
+		}
+		site.thread = name;
+		site.write  = write;
+	}
+	site.count++;
+	site.ns += ns;
+	site.last_address = address;
 }
 
 void CountFrame(bool new_frame) noexcept {

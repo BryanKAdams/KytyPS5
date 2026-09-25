@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
@@ -797,6 +798,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		Libs::Graphics::DrainStats::t_fault_pc = info->exception_address;
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}

@@ -64,6 +64,23 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	const bool gpu_thread = GuestGpu::IsGpuThread();
+	struct SiteTimer {
+		bool                                  enabled;
+		bool                                  write;
+		uint64_t                              address;
+		std::chrono::steady_clock::time_point start;
+		~SiteTimer() {
+			if (enabled) {
+				const auto elapsed = std::chrono::steady_clock::now() - start;
+				DrainStats::RecordFaultSite(
+				    DrainStats::t_fault_pc, address, write,
+				    static_cast<uint64_t>(
+				        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+			}
+		}
+	} site_timer {DrainStats::Enabled(), access == PageFaultAccess::Write, fault_vaddr,
+	              DrainStats::Enabled() ? std::chrono::steady_clock::now()
+	                                    : std::chrono::steady_clock::time_point {}};
 	if (access == PageFaultAccess::Write) {
 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
 		                                          : DrainStats::Reason::GuestWriteFault);
