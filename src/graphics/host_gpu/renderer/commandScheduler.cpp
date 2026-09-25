@@ -336,6 +336,16 @@ void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	g_deferred_callback_scheduler = previous;
 }
 
+bool CommandScheduler::IsPublished(uint64_t tick) {
+	if (!IsFree(tick)) {
+		return false;
+	}
+	std::lock_guard lock(m_operation_mutex);
+	const bool queued = !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+	const bool active = m_priority_active && m_priority_active_tick <= tick;
+	return !queued && !active;
+}
+
 bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;

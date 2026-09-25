@@ -889,6 +889,21 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	// A page holding GPU-written bytes is protected as a whole. Clean bytes on it come from the
+	// backing, so reading a game table that merely shares the page does not wait for a readback.
+	// The lock-free page hint keeps the common case a plain copy: a stale "clean" faults and
+	// reads back as before, and a stale "dirty" takes the checked backing read.
+	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
+		const auto& buffers = GetGpuResources().GetBufferCache();
+		if ((buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) &&
+		    IsGpuAddressRange(vaddr, size) && TryReadGpuCleanBacking(vaddr, data, size)) {
+			return;
+		}
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

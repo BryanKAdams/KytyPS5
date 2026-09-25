@@ -202,6 +202,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 	arm();
+	PruneInFlight();
+	auto& inflight = m_inflight_downloads.emplace_back();
+	inflight.tick  = m_scheduler.CurrentTick();
+	inflight.ranges.reserve(copies.size());
+	for (const auto& copy: copies) {
+		inflight.ranges.emplace_back(buffer_address + copy.srcOffset, copy.size);
+	}
 	m_scheduler.DeferPriorityOperation([this, token, pages = std::move(pages), download,
 	                                    owner = std::move(temporary), mapped, offset, total_size,
 	                                    buffer_address, copies = std::move(copies)] {
@@ -749,9 +756,30 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	// Armed pages have left the byte set but their backing is not published yet.
-	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
-	       m_memory_tracker.HasArmedPages(vaddr, size);
+	// Downloaded bytes have left the byte set, but their backing is valid only once published.
+	// Other bytes of an armed page are valid already: a window download around a CPU fault
+	// arms whole pages, and Thread_Gpu reads game tables that share such pages every frame.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) || InFlightIntersects(vaddr, size);
+}
+
+void BufferCache::PruneInFlight() {
+	while (!m_inflight_downloads.empty() &&
+	       m_scheduler.IsPublished(m_inflight_downloads.front().tick)) {
+		m_inflight_downloads.pop_front();
+	}
+}
+
+bool BufferCache::InFlightIntersects(uint64_t vaddr, uint64_t size) {
+	PruneInFlight();
+	const auto end = vaddr + size;
+	for (const auto& download: m_inflight_downloads) {
+		for (const auto& [address, bytes]: download.ranges) {
+			if (address < end && address + bytes > vaddr) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

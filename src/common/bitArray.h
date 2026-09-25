@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_COMMON_BITARRAY_H_
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,14 @@ public:
 
 	[[nodiscard]] constexpr bool Get(size_t index) const {
 		return (m_data[index / BITS_PER_WORD] & (uint64_t {1} << (index % BITS_PER_WORD))) != 0;
+	}
+
+	// Reads a bit that another thread may be changing under its own lock. The result can be
+	// stale; callers must treat it as a hint.
+	[[nodiscard]] bool GetRelaxed(size_t index) const noexcept {
+		auto& word = const_cast<uint64_t&>(m_data[index / BITS_PER_WORD]);
+		return (std::atomic_ref<uint64_t>(word).load(std::memory_order_relaxed) &
+		        (uint64_t {1} << (index % BITS_PER_WORD))) != 0;
 	}
 
 	constexpr void Set(size_t index) {

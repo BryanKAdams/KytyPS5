@@ -39,6 +39,16 @@ public:
 	void ArmReadback(uint64_t vaddr, uint64_t size, uint64_t token, uint64_t tick);
 	void FinalizeReadback(uint64_t vaddr, uint64_t size, uint64_t token);
 	[[nodiscard]] bool HasArmedPages(uint64_t vaddr, uint64_t size);
+	// Lock-free and possibly stale: whether the tracker page holding vaddr is GPU-dirty. Only
+	// for choosing a read path whose outcome stays correct either way.
+	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (index >= REGION_COUNT) {
+			return false;
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr && manager->GpuDirtyHint(vaddr);
+	}
 
 	// One conservative hint per tracker region. CPU-dirty bits remain authoritative.
 	// Dirty transitions, region creation, buffer registration and mapping publish hints.

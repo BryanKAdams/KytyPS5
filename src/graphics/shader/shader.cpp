@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -419,16 +420,20 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		// The tables can share a tracker page with GPU-written data (Astro Bot's do, once a
+		// frame); read them without faulting on that page.
+		uint32_t attribute = 0;
+		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(&attrib[in.semantic]),
+		                                        &attribute, sizeof(attribute));
+
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attribute);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t index = attribute & 0x1fu;
+		auto   format = static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		uint32_t offset      = (attribute >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
 		if (fetch_index != 0) {
 			static std::atomic<uint64_t> log_count = 0;
@@ -442,7 +447,9 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		uint32_t sharp[4] {};
+		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(&buffer[index * 4]),
+		                                        sharp, sizeof(sharp));
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 

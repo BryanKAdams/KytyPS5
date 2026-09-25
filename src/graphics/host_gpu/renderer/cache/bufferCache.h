@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <deque>
 #include <map>
 #include <span>
 #include <unordered_map>
@@ -68,6 +69,9 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
+		return m_memory_tracker.IsPageGpuDirtyHint(vaddr);
+	}
 	// Eager readback of hot pages: memory that CPU reads have faulted on. A write recorded to a
 	// hot page is downloaded at the next flush point, so its bytes are usually published before
 	// the CPU reads them again. OnCommandRecorded() marks writes of the bindings obtained so far
@@ -126,6 +130,9 @@ private:
 	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write);
 	void MarkReadbackHot(uint64_t vaddr);
 	void QueueEagerReadback(uint64_t vaddr, uint64_t size);
+	// Whether a recorded download of these bytes has not finished publishing.
+	[[nodiscard]] bool InFlightIntersects(uint64_t vaddr, uint64_t size);
+	void               PruneInFlight();
 	[[nodiscard]] bool SynchronizeBdaWord(size_t word, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
@@ -157,6 +164,13 @@ private:
 	std::unordered_map<uint64_t, uint64_t> m_hot_pages;
 	std::vector<uint64_t>                  m_eager_pending; // Written by unrecorded commands.
 	std::vector<uint64_t>                  m_eager_ready;   // Written by recorded commands.
+	// Downloaded byte ranges whose backing is not written yet, oldest first. They left
+	// m_gpu_modified_ranges when recorded; the other bytes of their pages are already valid.
+	struct InFlightDownload {
+		uint64_t                                   tick = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	std::deque<InFlightDownload> m_inflight_downloads;
 };
 
 } // namespace Libs::Graphics
