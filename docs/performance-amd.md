@@ -68,6 +68,32 @@ The dense evaluator, retained resource snapshots, and replacement of the old SRT
 were already present at the base revision. Their historical PR improvements are not additional gains
 from this branch.
 
+## Ported upstream pull requests
+
+These open upstream PRs were brought in as separate commits that keep their original authors.
+
+- **#483, skip the GPU drain on non-GPU unmaps:** `RenderContext::UnmapMemory` returns early
+  when a range never intersected the GPU-mapped set. Unmapping 64 KiB of CPU-only memory from a
+  guest thread took 79 us with an idle GPU and 130 us with 64 MiB of fill work queued; it now takes
+  0.10 us.
+- **#749, bounded event waits:** the main loop wakes at least every half vblank, so queued
+  main-thread callbacks such as the title update cannot stall presentation. Ported to SDL3. In a
+  1,200-update SDL3 harness, the unbounded wait's worst case reached 1.53 s (1.96 s in an earlier
+  run); the bounded wait's worst case was 8.0 ms.
+- **#820, zero reused direct memory:** new allocations and pool expansions no longer expose a
+  previous owner's bytes. A follow-up commit clears only ranges that were returned to the free list
+  before, so fresh backing is not touched (and committed) at allocation.
+- **#761, fragment helpers in ballots:** helper invocations no longer count in guest ballots or
+  in the lane-activity ballot for swizzle/bpermute. The PR's MoltenVK test-harness modes were not
+  carried over; its tests run on the full harness.
+- **#795, GPU tiler constants:** the tiler shaders avoid `uvec4` specialization-constant selects
+  that RADV miscompiled on the RX 9070 XT. The Windows driver already passed the tiler tests.
+
+Reviewed but not ported: #506 (its texture-residency change would raise memory to the pressure
+threshold, where eviction drains the GPU; read-only compute barriers almost never apply; block
+descriptor reads are already in `main`), #767 (duplicates #702 and the dense memo), #628, #484,
+#473 and #420 (superseded in `main`), #373 (covered by #638), and #637/#735 (MoltenVK-specific).
+
 ## Runtime comparison controls
 
 ```text
