@@ -39,9 +39,31 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Inputs of the previous refresh of one plan into one snapshot and specialization. Pass the same
+// memo only with the same plan, snapshot and specialization objects, and do not modify the
+// snapshot's descriptors or the specialization between refreshes.
+struct MaterializationMemo {
+	std::vector<uint32_t> key;
+	bool                  valid  = false;
+	// The last refresh kept the previous descriptors and specialization.
+	bool                  reused = false;
+};
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// With a memo, a memoizable plan whose descriptor inputs (active sources, user data, shader base
+// and flat SRT slots) are unchanged skips descriptor evaluation and specialization.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializationMemo* memo = nullptr);
+
+// The SrtWalker implementation that MaterializeResources must match.
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot&       snapshot,
+                                   ResourceSpecialization& specialization);
+
+// Debugging aid: compare every refresh with MaterializeResourcesReference and abort on a
+// difference. GPU thread only.
+void SetResourceMaterializationVerification(bool enabled);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

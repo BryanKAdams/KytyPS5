@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -205,7 +206,12 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::MaterializationMemo    memo;
 		std::vector<Permutation>                    permutations;
+		// Permutations only grow and never repeat a (push data start, specialization) pair, so
+		// the last hit stays valid while the specialization and push data cursor are unchanged.
+		uint32_t                                    last_permutation = UINT32_MAX;
+		uint32_t                                    last_push_cursor = 0;
 		bool                                        skip_dispatch = false;
 	};
 
@@ -293,24 +299,36 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    // TryReadGpuCleanBacking fails for a range when any byte is GPU-dirty or unbacked.
+		    .specialization_block_reads = true,
 		};
 		if (entry != programs.end()) {
+			auto& source = entry->second;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
-				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
-				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
+			    source.resource_plan, runtime, source.resources, source.specialization,
+			    &source.memo));
+			const auto matches = [&](const Permutation& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                                    layout.ShaderDataDwords()) &&
+				       candidate.specialization == source.specialization;
+			};
+			auto index = source.last_permutation;
+			if (index >= source.permutations.size() ||
+			    ((!source.memo.reused || source.last_push_cursor != push_data_cursor) &&
+			     !matches(source.permutations[index]))) {
+				index = static_cast<uint32_t>(
+				    std::ranges::find_if(source.permutations, matches) -
+				    source.permutations.begin());
+			}
+			if (index < source.permutations.size()) {
+				auto& permutation       = source.permutations[index];
+				source.last_permutation = index;
+				source.last_push_cursor = push_data_cursor;
+				input_info.stage = {.program = &permutation.program, .resources = &source.resources};
+				permutation.program.bindings.AdvancePushData(push_data_cursor);
+				return permutation.handle;
 			}
 		}
 
@@ -364,10 +382,13 @@ struct PipelineCache::ProgramCache {
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			    entry->second.specialization, &entry->second.memo));
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		entry->second.last_permutation =
+		    static_cast<uint32_t>(entry->second.permutations.size() - 1u);
+		entry->second.last_push_cursor = push_data_cursor;
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		if (recording.IsOpen()) {
@@ -394,6 +415,12 @@ struct PipelineCache::ProgramCache {
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		// Debugging aid: KYTY_VERIFY_SRT=1 checks every cached resource refresh against the
+		// reference SRT walker and aborts on a difference.
+		if (const char* verify = std::getenv("KYTY_VERIFY_SRT");
+		    verify != nullptr && std::strcmp(verify, "1") == 0) {
+			ShaderRecompiler::IR::SetResourceMaterializationVerification(true);
+		}
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {

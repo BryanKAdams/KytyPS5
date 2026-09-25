@@ -33866,6 +33866,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 #include "AttachmentFeedbackTests.inc"
 #include "PerformanceMemoryTests.inc"
 #include "ShaderPrecompileGpuTests.inc"
+#include "SrtMaterializationBenchmark.inc"
 
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
@@ -33887,6 +33888,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-benchmark") == 0) {
     VulkanHarness vulkan;
     RunBdaBenchmark(vulkan);
+    return 0;
+  }
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--srt-benchmark") == 0) {
+    RunSrtBenchmark(argv[2],
+                    argc == 4 ? static_cast<uint32_t>(std::atoi(argv[3])) : 0u);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
