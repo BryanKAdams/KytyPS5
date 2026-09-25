@@ -75,6 +75,7 @@ struct ConfigOptions {
 	uint32_t               drain_stats_interval        = 0;
 	bool                   dcc_gpu_clear_enabled       = true;
 	bool                   async_submit_enabled        = true;
+	bool                   gpu_mesh_indirect_enabled   = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -128,6 +129,8 @@ uint32_t GetDrainStatsInterval();
 bool DccGpuClearEnabled();
 // Submit the GPU thread's command buffers from a dedicated queue thread.
 bool AsyncSubmitEnabled();
+// Build mesh-emulated indirect draws with GPU-written arguments on the GPU.
+bool GpuMeshIndirectEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

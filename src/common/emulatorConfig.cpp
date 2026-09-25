@@ -163,6 +163,10 @@ bool AsyncSubmitEnabled() {
 	return g_config->async_submit_enabled;
 }
 
+bool GpuMeshIndirectEnabled() {
+	return g_config->gpu_mesh_indirect_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

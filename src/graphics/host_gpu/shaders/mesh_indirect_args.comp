@@ -1,0 +1,80 @@
+#version 450
+
+// Converts a guest DRAW_INDEX_INDIRECT argument block into a mesh draw without a CPU readback:
+// the draw's parameter record (the same seven dwords the CPU writes for direct mesh draws; see
+// EmitMeshDrawParameter) and a VkDrawMeshTasksIndirectCommandEXT.
+
+layout(local_size_x = 1) in;
+
+// Guest DrawIndexedIndirectArgs: index count, instance count, first index, base vertex,
+// first instance.
+layout(std430, binding = 0) readonly buffer Arguments {
+	uint arguments[];
+};
+
+// Record (7 dwords, padded to 8) followed by the mesh-tasks command (3 dwords).
+layout(std430, binding = 1) writeonly buffer Output {
+	uint outputs[];
+};
+
+layout(push_constant) uniform Params {
+	uint arguments_word;
+	uint output_word;
+	uint index_bytes;
+	uint index_low;
+	uint index_high;
+	uint index_limit;
+	uint primitive_size;
+	uint primitive_step;
+	uint primitives_per_group;
+	uint max_groups;
+	uint max_instances;
+	uint max_total;
+} params;
+
+void main() {
+	uint count = arguments[params.arguments_word + 0u];
+	uint instances = arguments[params.arguments_word + 1u];
+	const uint first_index = arguments[params.arguments_word + 2u];
+	const uint base_vertex = arguments[params.arguments_word + 3u];
+	const uint first_instance = arguments[params.arguments_word + 4u];
+
+	// The CPU path clamps the count to INDEX_BUFFER_SIZE the same way.
+	if (params.index_limit != 0u) {
+		count = min(count, params.index_limit);
+	}
+
+	// Index address = base + first_index * element size, carried into the high word.
+	const uint offset = first_index * params.index_bytes;
+	const uint low = params.index_low + offset;
+	const uint high = params.index_high + (low < offset ? 1u : 0u);
+
+	uint groups = 0u;
+	if (count >= params.primitive_size && instances != 0u) {
+		const uint primitives = (count - params.primitive_size) / params.primitive_step + 1u;
+		groups = (primitives - 1u) / params.primitives_per_group + 1u;
+	}
+	// Host limits. Guest draws this large would need sliced dispatches; clamp rather than
+	// exceed the limits (the CPU path slices instead).
+	groups = min(groups, params.max_groups);
+	instances = min(instances, params.max_instances);
+	if (groups != 0u && instances > params.max_total / groups) {
+		instances = params.max_total / groups;
+	}
+	if (groups == 0u || instances == 0u) {
+		groups = 0u;
+		instances = 0u;
+	}
+
+	const uint record = params.output_word;
+	outputs[record + 0u] = count;
+	outputs[record + 1u] = base_vertex;
+	outputs[record + 2u] = first_instance;
+	outputs[record + 3u] = params.index_bytes;
+	outputs[record + 4u] = low;
+	outputs[record + 5u] = high;
+	outputs[record + 6u] = 0u;
+	outputs[record + 8u] = groups;
+	outputs[record + 9u] = instances;
+	outputs[record + 10u] = 1u;
+}

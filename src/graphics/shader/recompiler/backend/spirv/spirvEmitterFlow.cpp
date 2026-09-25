@@ -584,11 +584,33 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	// Push-constant dwords 0 and 1 hold the device address of the draw's parameter record, so
+	// that an indirect draw can have the GPU write the record from its arguments.
+	const auto push_word = [&](uint32_t word) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, word));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto u64      = TypeScalarU64(state);
+	const auto constant = [&](uint64_t value) {
+		return state.builder.Constant(spv::OpConstant, u64, static_cast<uint32_t>(value),
+		                              static_cast<uint32_t>(value >> 32u));
+	};
+	const auto low  = Unary(state, spv::OpUConvert, u64, push_word(0));
+	const auto high = Binary(state, spv::OpShiftLeftLogical, u64,
+	                         Unary(state, spv::OpUConvert, u64, push_word(1)), constant(32));
+	const auto address =
+	    Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpBitwiseOr, u64, low, high),
+	           constant(uint64_t {index} * sizeof(uint32_t)));
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          address);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer,
+	                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
 	return result;
 }
 

@@ -87,6 +87,8 @@ static void PrintUsage() {
 	         "Default: true.\n");
 	::printf("  --async-submit <true|false>          Submit GPU work from a dedicated queue thread. "
 	         "Default: true.\n");
+	::printf("  --gpu-mesh-indirect <true|false>     Build mesh-emulated indirect draws on the GPU. "
+	         "Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -359,6 +361,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.drain_stats_interval = interval;
 		} else if (arg == "--dcc-gpu-clear") {
 			if (!ParseBool(value, options.config.dcc_gpu_clear_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-mesh-indirect") {
+			if (!ParseBool(value, options.config.gpu_mesh_indirect_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
