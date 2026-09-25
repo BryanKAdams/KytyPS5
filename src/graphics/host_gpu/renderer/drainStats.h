@@ -30,6 +30,7 @@ enum class Reason : uint8_t {
 	DownloadRingWrap,
 	FaultBuffer,
 	PresentFrame,
+	EagerReadback,
 	Count,
 };
 

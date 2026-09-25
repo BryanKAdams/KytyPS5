@@ -318,6 +318,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	// Thread_Gpu consumes the bytes itself, so it waits here. Pages armed by an earlier
 	// (already submitted) download only need their own tick, which is not a full drain.
+	// Its reads do not mark pages hot: they read shader code sharing a page with GPU data, or
+	// arguments written just before, where an eager download only delays the next wait.
 	RecordReadback(vaddr, size, is_write);
 	const auto state = m_memory_tracker.QueryReadback(vaddr, size);
 	if (state.gpu_dirty) {
@@ -343,6 +345,9 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) 
 		const auto reason = DrainStats::CurrentReason();
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason, &tick] {
 			DrainStats::ReasonScope reason_scope(reason);
+			if (!is_write) {
+				MarkReadbackHot(vaddr);
+			}
 			RecordReadback(vaddr, size, is_write);
 			const auto current = m_memory_tracker.QueryReadback(vaddr, size);
 			if (!current.gpu_dirty) {
@@ -366,6 +371,60 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) 
 		m_scheduler.GetMasterSemaphore().Wait(tick);
 	}
 	m_scheduler.WaitPriorityOperations(tick);
+}
+
+void BufferCache::MarkReadbackHot(uint64_t vaddr) {
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto tick = m_scheduler.CurrentTick();
+	if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
+		it->second = tick;
+		return;
+	}
+	if (m_hot_pages.size() >= HotReadbackPages) {
+		// Replace the page whose latest fault is the oldest.
+		m_hot_pages.erase(std::min_element(
+		    m_hot_pages.begin(), m_hot_pages.end(),
+		    [](const auto& a, const auto& b) { return a.second < b.second; }));
+	}
+	m_hot_pages.emplace(page, tick);
+}
+
+void BufferCache::QueueEagerReadback(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	for (const auto& [page, tick]: m_hot_pages) {
+		(void)tick;
+		if (page < end && page + TRACKER_PAGE_SIZE > vaddr) {
+			m_eager_pending.push_back(page);
+		}
+	}
+}
+
+void BufferCache::OnCommandRecorded() {
+	if (m_eager_pending.empty()) {
+		return;
+	}
+	m_eager_ready.insert(m_eager_ready.end(), m_eager_pending.begin(), m_eager_pending.end());
+	m_eager_pending.clear();
+}
+
+void BufferCache::RecordEagerReadbacks() {
+	if (m_eager_ready.empty()) {
+		return;
+	}
+	DrainStats::ReasonScope reason(DrainStats::Reason::EagerReadback);
+	std::vector<uint64_t>   pages;
+	pages.swap(m_eager_ready);
+	std::sort(pages.begin(), pages.end());
+	pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+	for (const auto page: pages) {
+		// The written buffer may have been retired since; its pages then have no GPU owner.
+		if (!IsRegionRegistered(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		// Buffers are CACHING_PAGESIZE-aligned, so one buffer owns the whole tracker page.
+		auto& buffer = m_slot_buffers[FindBuffer(page, TRACKER_PAGE_SIZE)];
+		(void)DownloadBufferMemory(buffer, page, TRACKER_PAGE_SIZE);
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -570,6 +629,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_texture_cache.OnBufferGpuWrite(vaddr, size);
+		if (!m_hot_pages.empty()) {
+			QueueEagerReadback(vaddr, size);
+		}
 		if (DrainStats::Enabled()) {
 			DrainStats::RecordGpuWrite(vaddr, size);
 			if (m_texture_cache.IsKnownDccMetadata(vaddr, size)) {
@@ -631,6 +693,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	OnCommandRecorded();
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -664,6 +727,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	OnCommandRecorded();
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {

@@ -13,6 +13,7 @@
 
 #include <map>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -67,6 +68,12 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Eager readback of hot pages: memory that CPU reads have faulted on. A write recorded to a
+	// hot page is downloaded at the next flush point, so its bytes are usually published before
+	// the CPU reads them again. OnCommandRecorded() marks writes of the bindings obtained so far
+	// as recorded; only recorded writes are downloaded.
+	void               OnCommandRecorded();
+	void               RecordEagerReadbacks();
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
@@ -117,6 +124,8 @@ private:
 	void RecordReadback(uint64_t vaddr, uint64_t size, bool is_write);
 	// Other threads: publish GPU-dirty pages without draining Thread_Gpu.
 	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write);
+	void MarkReadbackHot(uint64_t vaddr);
+	void QueueEagerReadback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBdaWord(size_t word, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
 	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
@@ -143,6 +152,11 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	uint64_t m_readback_token     = 0;
+	// Tracker pages hit by CPU read faults, with the tick of their latest fault.
+	static constexpr size_t HotReadbackPages = 64;
+	std::unordered_map<uint64_t, uint64_t> m_hot_pages;
+	std::vector<uint64_t>                  m_eager_pending; // Written by unrecorded commands.
+	std::vector<uint64_t>                  m_eager_ready;   // Written by recorded commands.
 };
 
 } // namespace Libs::Graphics

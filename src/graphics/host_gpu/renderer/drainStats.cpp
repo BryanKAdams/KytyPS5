@@ -49,6 +49,8 @@ struct FaultSite {
 	uint64_t    written      = 0; // Faults whose writer is still in the history.
 	uint64_t    frame_age    = 0; // Sum of frames between the write and the fault.
 	uint32_t    writer_op    = NoPm4Op;
+	uint64_t    writer_begin = 0; // Range of the newest writer seen.
+	uint64_t    writer_size  = 0;
 };
 
 // Per-interval fault sites, keyed by faulting instruction and access. Faults that stall are
@@ -121,6 +123,7 @@ const char* ReasonName(Reason reason) {
 		case Reason::DownloadRingWrap: return "download-ring-wrap";
 		case Reason::FaultBuffer: return "fault-buffer";
 		case Reason::PresentFrame: return "present-frame";
+		case Reason::EagerReadback: return "eager-readback";
 		case Reason::Count: break;
 	}
 	return "?";
@@ -251,7 +254,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	});
 	size_t printed = 0;
 	for (const auto& row: rows) {
-		if (printed++ == 32) {
+		if (printed++ == 48) {
 			break;
 		}
 		if (IsTimeKind(row.kind)) {
@@ -297,7 +300,8 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 		                    site.write ? "write" : "read", pc, site.thread, site.count, ms,
 		                    ms / static_cast<double>(site.count), site.last_address);
 		if (site.written != 0) {
-			text += fmt::format(" writer={} known={}/{} age={:.2f}frames", OpName(site.writer_op),
+			text += fmt::format(" writer={} range={:#014x}+{:#x} known={}/{} age={:.2f}frames",
+			                    OpName(site.writer_op), site.writer_begin, site.writer_size,
 			                    site.written, site.count,
 			                    static_cast<double>(site.frame_age) /
 			                        static_cast<double>(site.written));
@@ -381,7 +385,9 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
 	if (writer.end != 0) {
 		site.written++;
 		site.frame_age += g_frames.load(std::memory_order_relaxed) - writer.frame;
-		site.writer_op = writer.op;
+		site.writer_op    = writer.op;
+		site.writer_begin = writer.begin;
+		site.writer_size  = writer.end - writer.begin;
 	}
 	if (site.count == 0) {
 		char name[64] = "(host thread)";

@@ -268,10 +268,12 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	m_renderer.GetBufferCache().RecordEagerReadbacks();
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::BufferFlushIfGpuIdle() {
+	m_renderer.GetBufferCache().RecordEagerReadbacks();
 	auto& scheduler = GetScheduler();
 	if (scheduler.IsFree(scheduler.CurrentTick() - 1)) {
 		scheduler.Flush();
