@@ -97,6 +97,8 @@ const char* KindName(Kind kind) {
 		case Kind::QueueLockWait: return "queue-lock-wait";
 		case Kind::IndirectArgsCpu: return "indirect-cpu";
 		case Kind::IndirectArgsGpu: return "indirect-gpu";
+		case Kind::GpuBusy: return "gpu-busy";
+		case Kind::GpuGap: return "gpu-gap";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -200,6 +202,8 @@ bool IsTimeKind(Kind kind) {
 		case Kind::PriorityWait:
 		case Kind::BlockedPoll:
 		case Kind::Submit:
+		case Kind::GpuBusy:
+		case Kind::GpuGap:
 		case Kind::QueueLockWait: return true;
 		default: return false;
 	}
@@ -233,7 +237,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	    "drain-stats: {:.1f}s frames={} ({:.1f}/s) presents={}", seconds, frames,
 	    frames / seconds, after.presents - before.presents);
 	for (const auto kind: {Kind::FullDrain, Kind::TickWait, Kind::PriorityWait, Kind::BlockedPoll,
-	                       Kind::Submit, Kind::QueueLockWait}) {
+	                       Kind::Submit, Kind::QueueLockWait, Kind::GpuBusy, Kind::GpuGap}) {
 		const auto k  = static_cast<size_t>(kind);
 		const auto ms = static_cast<double>(kind_value[k]) / 1e6;
 		text += fmt::format(" | {} n={} {:.1f}ms ({:.2f}ms/frame)", KindName(kind), kind_count[k],

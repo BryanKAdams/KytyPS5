@@ -48,6 +48,8 @@ enum class Kind : uint8_t {
 	QueueLockWait, // Time a submit waited for the queue lock (held by present or another submit).
 	IndirectArgsCpu, // An indirect draw read CPU-clean args; the value counts mesh-emulated draws.
 	IndirectArgsGpu, // An indirect draw read GPU-written args; the value counts mesh-emulated draws.
+	GpuBusy,       // GPU execution time (union of command-buffer intervals), in ns.
+	GpuGap,        // GPU time between command buffers with none executing, in ns.
 	Count,
 };
 

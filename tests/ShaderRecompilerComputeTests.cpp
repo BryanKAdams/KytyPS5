@@ -82,6 +82,7 @@
 #include <numeric>
 #include <optional>
 #include <semaphore>
+#include <thread>
 #include <set>
 #include <span>
 #include <sstream>
@@ -967,6 +968,10 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
+    // Tests use GuestGpu::Done as a full barrier and count RELEASE_MEM submits per packet; the
+    // frames-ahead and batching tests opt in explicitly.
+    options.gpu_frames_ahead = 0;
+    options.label_flush_interval_us = 0;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -2597,13 +2602,30 @@ public:
         const bool gds_interrupt_waited_once =
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
 
+        // Within the label flush interval an interrupt batches into the open
+        // command buffer; the end of the submission slice submits it.
+        Config::ConfigOptions batching;
+        batching.printf_direction = Config::LogDirection::Silent;
+        batching.gpu_frames_ahead = 0;
+        batching.label_flush_interval_us = 100000;
+        Config::Load(batching);
+        auto batched_interrupt = make_release_mem(0, 4, nullptr, 0);
+        Pm4Execution batched_execution;
+        const auto batched_tick = gpu_scheduler.CurrentTick();
+        const auto batched_result =
+            processor->Process(batched_execution, batched_interrupt);
+        const bool batched_kept_open = gpu_scheduler.CurrentTick() == batched_tick;
+        batching.label_flush_interval_us = 0;
+        Config::Load(batching);
+
         release_mem_submission_counts =
             immediate_result == Pm4ProcessResult::Complete &&
             immediate_split_once && gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
             interrupt_split_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
-            gds_interrupt_waited_once;
+            gds_interrupt_waited_once &&
+            batched_result == Pm4ProcessResult::Complete && batched_kept_open;
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -2646,6 +2668,54 @@ public:
     Require("GpuCommandLane", "borrowed graphics commands",
             live_graphics_value == 22,
             "graphics submission executed a copied PM4 stream");
+
+    {
+      // One frame ahead: a suspend point waits for the previous suspend point's
+      // work, not its own, so the game can build the next frame meanwhile.
+      Config::ConfigOptions ahead;
+      ahead.printf_direction = Config::LogDirection::Silent;
+      ahead.gpu_frames_ahead = 1;
+      ahead.label_flush_interval_us = 0;
+      Config::Load(ahead);
+      uint32_t first_value = 0;
+      uint32_t second_value = 0;
+      std::array<uint32_t, 5> first_commands{};
+      std::array<uint32_t, 5> second_commands{};
+      write_packet(first_commands.data(), &first_value, 1);
+      write_packet(second_commands.data(), &second_value, 2);
+      std::binary_semaphore gate_entered{0};
+      std::binary_semaphore gate_release{0};
+      gpu.SendCommand([&] {
+        gate_entered.release();
+        gate_release.acquire();
+      });
+      gate_entered.acquire();
+      gpu.Submit(first_commands, {});
+      gpu.Done();
+      const bool first_did_not_wait = first_value == 0;
+      gpu.Submit(second_commands, {});
+      std::atomic_bool second_returned{false};
+      std::thread second_done([&] {
+        gpu.Done();
+        second_returned.store(true);
+      });
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const bool second_waited = !second_returned.load();
+      gate_release.release();
+      second_done.join();
+      const bool first_completed = first_value == 1;
+      Config::ConfigOptions barrier;
+      barrier.printf_direction = Config::LogDirection::Silent;
+      barrier.gpu_frames_ahead = 0;
+      barrier.label_flush_interval_us = 0;
+      Config::Load(barrier);
+      gpu.Done();
+      Require("GpuCommandLane", "frames-ahead suspend points",
+              first_did_not_wait && second_waited && first_completed &&
+                  second_value == 2,
+              "a suspend point waited for its own frame or did not bound the "
+              "previous one");
+    }
 
     uint32_t live_compute_value = 0;
     std::array<uint32_t, 5> live_compute_commands{};

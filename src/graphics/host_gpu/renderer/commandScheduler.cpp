@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -102,6 +103,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_timestamp_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_timestamp_pool, nullptr);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -346,6 +350,12 @@ bool CommandScheduler::IsPublished(uint64_t tick) {
 	return !queued && !active;
 }
 
+uint64_t CommandScheduler::MicrosSinceSubmit() const noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now() - m_last_submit)
+	                                 .count());
+}
+
 bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;
@@ -367,7 +377,58 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (m_async_submit && DrainStats::Enabled()) {
+		WriteStartTimestamp();
+	}
 	return m_command;
+}
+
+void CommandScheduler::WriteStartTimestamp() {
+	if (m_timestamp_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = TimestampSlots * 2;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_timestamp_pool),
+		                     "create GPU timestamp pool");
+	}
+	m_timestamp_slot = m_timestamp_next++ % TimestampSlots;
+	m_command.m_buffer.resetQueryPool(m_timestamp_pool, m_timestamp_slot * 2, 2);
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_timestamp_pool,
+	                                  m_timestamp_slot * 2);
+}
+
+void CommandScheduler::WriteEndTimestamp() {
+	const auto slot  = m_timestamp_slot;
+	m_timestamp_slot = UINT32_MAX;
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timestamp_pool,
+	                                  slot * 2 + 1);
+	// Runs on this thread once the buffer's tick completes, in tick order.
+	std::lock_guard lock(m_operation_mutex);
+	m_pending_operations.push({[this, slot] { ReadTimestamps(slot); }, CurrentTick()});
+}
+
+void CommandScheduler::ReadTimestamps(uint32_t slot) {
+	uint64_t   values[2] {};
+	const auto result = m_graphics.device.getQueryPoolResults(
+	    m_timestamp_pool, slot * 2, 2, sizeof(values), values, sizeof(uint64_t),
+	    vk::QueryResultFlagBits::e64);
+	if (result != vk::Result::eSuccess || values[1] < values[0]) {
+		return;
+	}
+	const double period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	const auto   to_ns  = [period](uint64_t ticks) {
+        return static_cast<uint64_t>(static_cast<double>(ticks) * period);
+	};
+	// Busy time is the union of command-buffer intervals; a gap is GPU time with no buffer.
+	const auto [start, end] = std::pair {values[0], values[1]};
+	if (m_gpu_last_end != 0 && start > m_gpu_last_end) {
+		DrainStats::Record(DrainStats::Kind::GpuGap, to_ns(start - m_gpu_last_end));
+	}
+	const auto from = std::max(start, m_gpu_last_end);
+	if (end > from) {
+		DrainStats::Record(DrainStats::Kind::GpuBusy, to_ns(end - from));
+	}
+	m_gpu_last_end = std::max(m_gpu_last_end, end);
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -375,6 +436,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_timestamp_slot != UINT32_MAX) {
+		WriteEndTimestamp();
+	}
+	m_last_submit = std::chrono::steady_clock::now();
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
 

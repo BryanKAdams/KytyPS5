@@ -75,6 +75,8 @@ public:
 	void            BufferFlush();
 	// Submits only when the GPU has retired every earlier submission.
 	void            BufferFlushIfGpuIdle();
+	// Submits for a queued interrupt, batching within the label flush interval.
+	void            BufferFlushForInterrupt();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }

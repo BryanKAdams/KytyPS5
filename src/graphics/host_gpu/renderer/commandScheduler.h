@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -54,6 +55,8 @@ public:
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// Microseconds since this scheduler last submitted (recording thread only).
+	[[nodiscard]] uint64_t         MicrosSinceSubmit() const noexcept;
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
@@ -130,6 +133,17 @@ private:
 	std::deque<SubmitJob>        m_submit_jobs;
 	std::jthread                 m_submit_thread;
 	bool                         m_async_submit = false;
+	// --drain-stats on the render scheduler: GPU execution time from timestamps written at the
+	// start and end of each command buffer, read back once its tick completes.
+	static constexpr uint32_t TimestampSlots = 4096;
+	void                      WriteStartTimestamp();
+	void                      WriteEndTimestamp();
+	void                      ReadTimestamps(uint32_t slot);
+	vk::QueryPool             m_timestamp_pool = nullptr;
+	uint32_t                  m_timestamp_next = 0;
+	uint32_t                  m_timestamp_slot = UINT32_MAX; // Slot of the recording buffer.
+	uint64_t                  m_gpu_last_end   = 0;          // Latest end seen, in ticks.
+	std::chrono::steady_clock::time_point m_last_submit {};
 };
 
 } // namespace Libs::Graphics

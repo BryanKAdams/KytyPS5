@@ -76,6 +76,8 @@ struct ConfigOptions {
 	bool                   dcc_gpu_clear_enabled       = true;
 	bool                   async_submit_enabled        = true;
 	bool                   gpu_mesh_indirect_enabled   = true;
+	uint32_t               gpu_frames_ahead            = 0;
+	uint32_t               label_flush_interval_us     = 2000;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -131,6 +133,10 @@ bool DccGpuClearEnabled();
 bool AsyncSubmitEnabled();
 // Build mesh-emulated indirect draws with GPU-written arguments on the GPU.
 bool GpuMeshIndirectEnabled();
+// Frames the game may build ahead of Thread_Gpu at sceAgcSuspendPoint; 0 waits for idle.
+uint32_t GetGpuFramesAhead();
+// Minimum time between submits made at plain RELEASE_MEM labels; 0 submits at every idle label.
+uint32_t GetLabelFlushIntervalUs();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

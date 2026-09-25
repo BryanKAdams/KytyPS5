@@ -202,7 +202,23 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
-		WaitForIdle();
+		const auto frames_ahead = Config::GetGpuFramesAhead();
+		if (frames_ahead == 0) {
+			WaitForIdle();
+		} else {
+			// sceAgcSuspendPoint does not wait for the GPU on hardware. Waiting for the work of an
+			// earlier suspend point instead of this one lets the game build the next frame while
+			// Thread_Gpu processes this one, at most `frames_ahead` frames ahead.
+			{
+				Common::LockGuard queue_lock(m_queue_mutex);
+				m_done_marks.push_back(m_next_sequence);
+			}
+			while (m_done_marks.size() > frames_ahead) {
+				const auto mark = m_done_marks.front();
+				m_done_marks.pop_front();
+				WaitForSubmissionsBefore(mark);
+			}
+		}
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -275,7 +291,22 @@ void CommandProcessor::BufferFlush() {
 void CommandProcessor::BufferFlushIfGpuIdle() {
 	m_renderer.GetBufferCache().RecordEagerReadbacks();
 	auto& scheduler = GetScheduler();
-	if (scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+	// An idle GPU finishes a label's few draws in tens of microseconds, so submitting at every
+	// idle label made hundreds of tiny submits a frame whose CPU cost starved the GPU. Batch
+	// until the minimum interval since the last submit has passed.
+	const bool batched =
+	    scheduler.MicrosSinceSubmit() >= Config::GetLabelFlushIntervalUs();
+	if (batched && scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+		scheduler.Flush();
+	}
+}
+
+void CommandProcessor::BufferFlushForInterrupt() {
+	// An interrupt fires when its tick completes, so that tick must be submitted. Within the
+	// minimum interval it batches instead: the end of the submission slice submits at the latest.
+	m_renderer.GetBufferCache().RecordEagerReadbacks();
+	auto& scheduler = GetScheduler();
+	if (scheduler.MicrosSinceSubmit() >= Config::GetLabelFlushIntervalUs()) {
 		scheduler.Flush();
 	}
 }
@@ -465,6 +496,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.sequence = m_next_sequence++;
+	m_outstanding.insert(submission.sequence);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -473,6 +506,13 @@ void GuestGpu::Enqueue(Submission submission) {
 void GuestGpu::WaitForIdle() {
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		m_idle.Wait(&m_queue_mutex);
+	}
+}
+
+void GuestGpu::WaitForSubmissionsBefore(uint64_t sequence) {
+	Common::LockGuard lock(m_queue_mutex);
+	while (!m_outstanding.empty() && *m_outstanding.begin() < sequence && !m_stopping) {
 		m_idle.Wait(&m_queue_mutex);
 	}
 }
@@ -566,6 +606,13 @@ void GuestGpu::ThreadRun(void* data) {
 				if (!queue.empty()) {
 					queue.front().blocked = false;
 				}
+			}
+			// A suspend point may be waiting for the oldest outstanding submission.
+			const bool oldest = !gpu->m_outstanding.empty() &&
+			                    *gpu->m_outstanding.begin() == submission.sequence;
+			gpu->m_outstanding.erase(submission.sequence);
+			if (oldest) {
+				gpu->m_idle.SignalAll();
 			}
 		}
 		gpu->m_processing = false;

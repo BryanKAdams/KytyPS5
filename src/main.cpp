@@ -89,6 +89,10 @@ static void PrintUsage() {
 	         "Default: true.\n");
 	::printf("  --gpu-mesh-indirect <true|false>     Build mesh-emulated indirect draws on the GPU. "
 	         "Default: true.\n");
+	::printf("  --gpu-frames-ahead <0-3>             Frames the game may build ahead of the GPU "
+	         "thread. 0 waits for idle. Default: 0.\n");
+	::printf("  --label-flush-interval-us <us>       Minimum time between RELEASE_MEM submits. "
+	         "Default: 2000.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -359,6 +363,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.drain_stats_interval = interval;
+		} else if (arg == "--label-flush-interval-us") {
+			uint32_t interval = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), interval);
+			if (error != std::errc {} || end != value.data() + value.size() || interval > 100000) {
+				::printf("invalid label-flush-interval-us: %s\n", value.c_str());
+				return false;
+			}
+			options.config.label_flush_interval_us = interval;
+		} else if (arg == "--gpu-frames-ahead") {
+			uint32_t frames = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), frames);
+			if (error != std::errc {} || end != value.data() + value.size() || frames > 3) {
+				::printf("invalid gpu-frames-ahead (0-3): %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_frames_ahead = frames;
 		} else if (arg == "--dcc-gpu-clear") {
 			if (!ParseBool(value, options.config.dcc_gpu_clear_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

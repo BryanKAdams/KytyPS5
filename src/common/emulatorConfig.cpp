@@ -167,6 +167,16 @@ bool GpuMeshIndirectEnabled() {
 	return g_config->gpu_mesh_indirect_enabled;
 }
 
+uint32_t GetGpuFramesAhead() {
+	return g_config->gpu_frames_ahead;
+}
+
+
+uint32_t GetLabelFlushIntervalUs() {
+	return g_config->label_flush_interval_us;
+}
+
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
