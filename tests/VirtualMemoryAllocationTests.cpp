@@ -843,6 +843,79 @@ void TestDirectMemoryReuseIsZeroFilled() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestDirectMemoryPartialReuseIsZeroFilled() {
+	const char*        test      = "DirectMemoryPartialReuseIsZeroFilled";
+	constexpr uint64_t StaleSize = SceKernelPageSize;
+	constexpr uint64_t MapSize   = SceKernelPageSize * 3;
+	constexpr uint8_t  Poison    = 0x5c;
+	const auto         direct    = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+
+	int64_t stale_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, direct, StaleSize, SceKernelPageSize, SceKernelMtypeC,
+	            &stale_phys),
+	        "KernelAllocateDirectMemory(stale)");
+	void* stale = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &stale, StaleSize, SceKernelProtCpuRw, 0, stale_phys, SceKernelPageSize,
+	            "direct_partial_stale"),
+	        "KernelMapNamedDirectMemory(stale)");
+	std::memset(stale, Poison, StaleSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(stale), StaleSize),
+	        "KernelMunmap(stale)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(stale_phys, StaleSize),
+	        "KernelCheckedReleaseDirectMemory(stale)");
+
+	// A larger allocation starting at the released page covers it plus never-used pages. Only
+	// the released page is stale, but every byte handed out must still read as zero.
+	int64_t reused_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            stale_phys, direct, MapSize, SceKernelPageSize, SceKernelMtypeC, &reused_phys),
+	        "KernelAllocateDirectMemory(partial reuse)");
+	Check(test, reused_phys == stale_phys,
+	      "released direct page was not reused, so partial zero-fill went untested");
+	void* reused = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &reused, MapSize, SceKernelProtCpuRw, 0, reused_phys, SceKernelPageSize,
+	            "direct_partial_reuse"),
+	        "KernelMapNamedDirectMemory(partial reuse)");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(reused);
+	Check(test,
+	      std::all_of(bytes, bytes + MapSize, [](uint8_t value) { return value == 0; }),
+	      "partially reused direct backing exposed stale bytes");
+
+	// Contents written after allocation are the owner's; a remap must still see them.
+	std::memset(reused, Poison, MapSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(reused), MapSize),
+	        "KernelMunmap(partial reuse)");
+	void* remapped = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &remapped, MapSize, SceKernelProtCpuRw, 0, reused_phys, SceKernelPageSize,
+	            "direct_partial_remap"),
+	        "KernelMapNamedDirectMemory(remap)");
+	const auto* remapped_bytes = reinterpret_cast<const uint8_t*>(remapped);
+	Check(test,
+	      std::all_of(remapped_bytes, remapped_bytes + MapSize,
+	                  [](uint8_t value) { return value == Poison; }),
+	      "remapping an allocated direct range lost its contents");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(remapped), MapSize),
+	        "KernelMunmap(remap)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(reused_phys, MapSize),
+	        "KernelCheckedReleaseDirectMemory(partial reuse)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestSmallerFlexibleMapReusesReleasedHole() {
 	const char*        test       = "SmallerFlexibleMapReusesReleasedHole";
 	const auto         baseline   = AvailableFlexibleMemory(test);
@@ -3182,6 +3255,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestDirectMemoryReuseIsZeroFilled);
+	RunTest(TestDirectMemoryPartialReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
